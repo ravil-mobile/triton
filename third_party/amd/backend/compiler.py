@@ -207,6 +207,10 @@ class HIPBackend(BaseBackend):
 
     @staticmethod
     def make_amdgcn(src, metadata, options):
+
+        with open('/tmp/amd.llir', 'w') as file:
+            file.write(src)
+
         # Find kernel names (there should only be one)
         # We get the name at the last possible step to accomodate `triton.compile`
         # on user-provided LLVM
@@ -214,6 +218,7 @@ class HIPBackend(BaseBackend):
         assert len(names) == 1
         metadata["name"] = names[0]
         # llvm -> hsaco
+        # amdgcn-amd-amdhsa
         amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, '', [], options.enable_fp_fusion, False)
         if os.environ.get("AMDGCN_ENABLE_DUMP", "0") == "1":
             print("// -----// AMDGCN Dump //----- //")
@@ -234,12 +239,43 @@ class HIPBackend(BaseBackend):
                 ret = fd_out.read()
         return ret
 
+    @staticmethod
+    def make_legacy_hsaco(src, metadata, options):
+        # Find kernel names (there should only be one)
+        # We get the name at the last possible step to accomodate `triton.compile`
+        # on user-provided LLVM
+        names = re.findall(r"define amdgpu_kernel void @([a-zA-Z_][a-zA-Z0-9_]*)", src)
+        assert len(names) == 1
+        metadata["name"] = names[0]
+        # llvm -> hsaco
+        hsaco = llvm.translate_to_asm(src, 'amdgcn-amd-amdhsa', options.arch, '', [], options.enable_fp_fusion, True)
+        if os.environ.get("AMDGCN_ENABLE_DUMP", "0") == "1":
+            hsaco_str = llvm.translate_to_asm(src, 'amdgcn-amd-amdhsa', options.arch, '', [], options.enable_fp_fusion,
+                                              False)
+            print("// -----// AMDGCN Dump //----- //")
+            print(hsaco_str)
+        import subprocess
+        rocm_path = HIPBackend.path_to_rocm_lld()
+        with tempfile.NamedTemporaryFile() as tmp_out:
+            with tempfile.NamedTemporaryFile() as tmp_in:
+                with open(tmp_in.name, 'wb') as fd_in:
+                    fd_in.write(hsaco)
+                subprocess.check_call([rocm_path, '-flavor', 'gnu', '-shared', tmp_in.name, '-o', tmp_out.name])
+            with open(tmp_out.name, 'rb') as fd_out:
+                ret = fd_out.read()
+        return ret
+
     def add_stages(self, stages, options):
+        use_legacy_backend = os.environ.get("TRITON_AMD_LEGACY_BACKEND", "0") == "1"
+
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
-        stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
-        stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
+        if use_legacy_backend:
+            stages["hsaco"] = lambda src, metadata: self.make_legacy_hsaco(src, metadata, options)
+        else:
+            stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
+            stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
 
     @functools.lru_cache()
     def hash(self):

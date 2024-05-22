@@ -233,6 +233,10 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ptx(src, metadata, opt, capability):
+
+        with open('/tmp/cuda.llir', 'w') as file:
+            file.write(src)
+
         ptx_version = opt.ptx_version
         if ptx_version is None:
             _, cuda_version = _path_to_binary("ptxas")
