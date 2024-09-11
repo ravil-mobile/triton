@@ -46,6 +46,7 @@ struct LoadInfo {
 static void createStreamCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
                              Value extractIdx, tt::CoarseSchedule &schedule,
                              tt::CoarseSchedule::Cluster prefetchCluster,
+                             tt::CoarseSchedule::Cluster localLoadCluster,
                              llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
                              int numStages) {
   OpBuilder builder(forOp);
@@ -74,8 +75,6 @@ static void createStreamCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
       allocTy.getEncoding(), sharedMemorySpace, /*mutableMemory=*/true);
   auto viewLoad =
       builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, loadOffsets);
-  auto storeOp =
-      builder.create<ttg::LocalStoreOp>(loc, copy->getResult(0), viewLoad);
   // Clean up old local caches.
   SmallVector<ttg::LocalAllocOp> allocsToErase;
   for (Operation *user : loadOp->getUsers()) {
@@ -104,8 +103,11 @@ static void createStreamCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
   // Prefetch load ahead of the dot stage if is used by the dot.
   if (loadToInfo[loadOp].usedByDot) {
     assert(numStages >= 2 && "requires num_stages=2 at least");
-    schedule.insert(storeOp, numStages - 2, prefetchCluster);
-    schedule.insert(viewLoad, numStages - 2, prefetchCluster);
+    schedule.insert(sharedLoad, numStages - 2, localLoadCluster);
+    auto storeOp =
+        builder.create<ttg::LocalStoreOp>(loc, copy->getResult(0), viewLoad);
+    schedule.insert(storeOp, numStages - 3, prefetchCluster);
+    schedule.insert(viewLoad, numStages - 3, prefetchCluster);
   }
   loadOp.erase();
 }
@@ -486,7 +488,7 @@ createStreamOps(scf::ForOp &forOp, tt::CoarseSchedule &schedule,
   // TODO: Use the precise number of buffers needed by the particular load.
   int numBuffers = -1;
   for (auto &[_, info] : loadToInfo)
-    numBuffers = std::max(numBuffers, info.distToUse);
+    numBuffers = std::max(numBuffers, info.distToUse - info.usedByDot);
   LDBG("deduced shared memory buffer number = " << numBuffers);
 
   SmallVector<Value> allocs;
@@ -530,12 +532,13 @@ createStreamOps(scf::ForOp &forOp, tt::CoarseSchedule &schedule,
   extractIdx = builder.create<arith::SelectOp>(loc, cndExt, extractIdx, zero);
 
   // Create a cluster for prefetching global reads for the dot.
+  tt::CoarseSchedule::Cluster localLoadCluster = schedule.clusters.newAtBack();
   tt::CoarseSchedule::Cluster prefetchCluster = schedule.clusters.newAtBack();
 
   for (auto &[op, alloc] : loadToAllocs) {
     if (auto loadOp = dyn_cast<tt::LoadOp>(op))
       createStreamCopy(forOp, loadOp, alloc, extractIdx, schedule,
-                       prefetchCluster, loadToInfo, numStages);
+                       prefetchCluster, localLoadCluster, loadToInfo, numStages);
   }
   // Patch the yield with the updated counters.
   appendToForOpYield(forOp, {extractIdx});
@@ -650,6 +653,7 @@ static bool pipelineLoop(scf::ForOp forOp, int numStages) {
   if (!checkPrecondition(forOp))
     return false;
 
+  numStages++;
   tt::PipeliningOption options;
   if (!preprocessLoopAndBuildSchedule(forOp, numStages, options))
     return false;
