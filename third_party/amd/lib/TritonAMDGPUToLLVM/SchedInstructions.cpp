@@ -181,7 +181,7 @@ struct InstructionSchedHintsRewriter
   // local (LDS to registers) and global (HBN to registers) data prefetching.
   // see:
   // include/ck/tensor_operation/gpu/block/blockwise_gemm_pipeline_xdlops_v3.h
-  void
+  llvm::LogicalResult
   createCKV3Schedule(PatternRewriter &rewriter, Location loc,
                      triton::amdgpu::InstructionSchedHint schedHint) const {
 
@@ -189,7 +189,7 @@ struct InstructionSchedHintsRewriter
           schedHint.getIsBufferLoadsBEnabled())) {
       LDBG("Skipping instruction scheduling because `ckv3` "
            "scheduling can be used only with `buffer_load` instructions");
-      return;
+      return llvm::failure();
     }
 
     const uint32_t numDsReadInstA = schedHint.getNumDsReadsA().getValue();
@@ -203,10 +203,10 @@ struct InstructionSchedHintsRewriter
     const uint32_t numBufferLoadInstB =
         schedHint.getNumGlobalLoadsB().getValue();
 
-    assert(numBufferLoadInstA &&
-           "buffer load count for tile A must be initialized");
-    assert(numBufferLoadInstB &&
-           "buffer load count for tile B must be initialized");
+    if (!(numBufferLoadInstA && numBufferLoadInstB)) {
+      LDBG("buffer load count for tile A and/or B must be initialized");
+      return llvm::failure();
+    }
 
     const uint32_t numMfmaInst = schedHint.getNumMMAs().getValue();
 
@@ -298,6 +298,8 @@ struct InstructionSchedHintsRewriter
       createSchedGroupBarrier(
           rewriter, loc, mlir::amdgpu::sched_barrier_opt_enum::mfma_wmma, 1, 0);
     }
+
+    return llvm::success();
   }
 
   LogicalResult
@@ -335,7 +337,10 @@ struct InstructionSchedHintsRewriter
       break;
     }
     case SchedulingType::CK_V3: {
-      createCKV3Schedule(rewriter, loc, instructionSchedHint);
+      auto result = createCKV3Schedule(rewriter, loc, instructionSchedHint);
+      if (llvm::failed(result)) {
+        return llvm::failure();
+      }
       break;
     }
     case SchedulingType::NONE:
