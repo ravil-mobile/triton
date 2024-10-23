@@ -3,6 +3,7 @@
 
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 
 namespace mlir {
 

@@ -352,7 +352,7 @@ FailureOr<Operation *> rewindUnaryOps(Value value) {
     auto defOp = value.getDefiningOp();
     if (isa<BlockArgument>(value))
       return failure();
-    if (defOp->getNumOperands() == 1)
+    if ((defOp->getNumOperands() == 1) || llvm::dyn_cast<TargetOpType>(defOp))
       return defOp;
     return failure();
   };
