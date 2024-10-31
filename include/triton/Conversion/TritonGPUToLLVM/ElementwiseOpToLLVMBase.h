@@ -3,6 +3,7 @@
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -16,14 +17,6 @@ namespace gpu {
 
 SmallVector<Value> reorderValues(const SmallVector<Value> &values, Type inType,
                                  Type ouType);
-
-SmallVector<Value> unpackI32(const SmallVector<Value> &inValues, Type srcTy,
-                             ConversionPatternRewriter &rewriter, Location loc,
-                             const LLVMTypeConverter *typeConverter);
-
-SmallVector<Value> packI32(const SmallVector<Value> &inValues, Type srcTy,
-                           ConversionPatternRewriter &rewriter, Location loc,
-                           const LLVMTypeConverter *typeConverter);
 
 Type getElementType(Value value);
 
@@ -86,10 +79,19 @@ public:
     if (!encoding)
       // encoding not available
       return resultVals;
-    if (!encoding.dyn_cast<BlockedEncodingAttr>() &&
-        !encoding.dyn_cast<SliceEncodingAttr>()) {
-      // TODO: constraining the ecndoing type here is necessary for avoiding
-      // crashes in the getElemsPerThread call below happening in the
+    Attribute baseEncoding = encoding;
+    if (isa<AMDMfmaEncodingAttr>(baseEncoding) ||
+        isa<AMDWmmaEncodingAttr>(baseEncoding))
+      // TODO: this logic seems incorrect for mfma and wmma layout. Skip for
+      // now. We saw mismatches for some flash-attention and dot tests on AMD
+      // backend. Note that this logic works for sliced layout whose parent is
+      // mfma layout. Therefore, this is not combined with the following check.
+      return resultVals;
+    while (auto sliced = dyn_cast<SliceEncodingAttr>(baseEncoding))
+      baseEncoding = sliced.getParent();
+    if (isa<NvidiaMmaEncodingAttr, DotOperandEncodingAttr>(baseEncoding)) {
+      // TODO: this logic seems incorrect for mma layout. Skip for now.
+      // The following test crashes and some other miscompile:
       // test_core::test_fp8_dot_acc
       return resultVals;
     }
@@ -102,8 +104,8 @@ public:
     if (!axisInfo)
       // axis info (e.g., constancy) not available
       return resultVals;
-    SmallVector<unsigned> sizePerThread = getSizePerThread(encoding);
-    if (rank != sizePerThread.size())
+    SmallVector<unsigned> contigPerThread = getContigPerThread(encoding);
+    if (rank != contigPerThread.size())
       return resultVals;
 
     SmallVector<int64_t> constancy = axisInfo->getConstancy();
@@ -111,13 +113,13 @@ public:
       return resultVals;
     bool hasConstancy = false;
     for (int i = 0; i < rank; ++i) {
-      if (constancy[i] > sizePerThread[i]) {
-        if (constancy[i] % sizePerThread[i] != 0)
-          // constancy is not evenly covered by sizePerThread
+      if (constancy[i] > contigPerThread[i]) {
+        if (constancy[i] % contigPerThread[i] != 0)
+          // constancy is not evenly covered by contigPerThread
           return resultVals;
         // can't move the values across different
-        // "sizePerThread"-sized blocks
-        constancy[i] = sizePerThread[i];
+        // "contigPerThread"-sized blocks
+        constancy[i] = contigPerThread[i];
       }
       if (elemsPerThread[i] < 1 || constancy[i] < 1)
         return resultVals;
@@ -177,8 +179,8 @@ public:
     for (auto operand : adaptor.getOperands()) {
       auto argTy = op->getOperand(0).getType();
       auto subOperands = unpackLLElements(loc, operand, rewriter);
-      subOperands = unpackI32(subOperands, argTy, rewriter, loc,
-                              this->getTypeConverter());
+      subOperands = unpackI32s(subOperands, argTy, rewriter, loc,
+                               this->getTypeConverter());
       allOperands.resize(subOperands.size());
       for (auto v : llvm::enumerate(subOperands))
         allOperands[v.index()].push_back(v.value());
@@ -205,7 +207,7 @@ public:
     }
     resultVals = maybeDeduplicate(op, resultVals);
     resultVals =
-        packI32(resultVals, resultTy, rewriter, loc, this->getTypeConverter());
+        packI32s(resultVals, resultTy, rewriter, loc, this->getTypeConverter());
     Value view = packLLElements(loc, this->getTypeConverter(), resultVals,
                                 rewriter, resultTy);
     rewriter.replaceOp(op, view);

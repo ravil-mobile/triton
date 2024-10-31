@@ -1,5 +1,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
+
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Support/LLVM.h"
 #include "triton/Conversion/MLIRTypes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
@@ -15,16 +17,16 @@ using ::mlir::triton::gpu::SliceEncodingAttr;
 
 TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(
     MLIRContext *ctx, LowerToLLVMOptions &option,
-    const DataLayoutAnalysis *analysis)
+    const TargetInfoBase &targetInfo, const DataLayoutAnalysis *analysis)
     : LLVMTypeConverter(ctx, option, analysis) {
   addConversion([&](triton::PointerType type) -> std::optional<Type> {
     return convertTritonPointerType(type);
   });
   addConversion([&](RankedTensorType type) -> std::optional<Type> {
-    return convertTritonTensorType(type);
+    return convertTritonTensorType(type, targetInfo);
   });
   addConversion([&](MemDescType type) -> std::optional<Type> {
-    return convertMemDescType(type);
+    return convertMemDescType(type, targetInfo);
   });
   addConversion([&](triton::gpu::AsyncTokenType type) -> std::optional<Type> {
     return convertAsyncToken(type);
@@ -32,15 +34,14 @@ TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(
   addConversion([&](mlir::Float8E4M3FNUZType type) -> std::optional<Type> {
     return IntegerType::get(type.getContext(), 8);
   });
+  addConversion([&](mlir::Float8E4M3FNType type) -> std::optional<Type> {
+    return IntegerType::get(type.getContext(), 8);
+  });
   addConversion([&](mlir::Float8E5M2Type type) -> std::optional<Type> {
     return IntegerType::get(type.getContext(), 8);
   });
   addConversion([&](mlir::Float8E5M2FNUZType type) -> std::optional<Type> {
     return IntegerType::get(type.getContext(), 8);
-  });
-  // Internally store bfloat16 as int16
-  addConversion([&](BFloat16Type type) -> std::optional<Type> {
-    return IntegerType::get(type.getContext(), 16);
   });
 }
 
@@ -74,10 +75,11 @@ Type TritonGPUToLLVMTypeConverter::getElementTypeForStruct(
   auto ctx = type.getContext();
   Attribute layout = type.getEncoding();
   Type elemTy = convertType(type.getElementType());
-  auto dotOpLayout = layout.dyn_cast<DotOperandEncodingAttr>();
+  auto dotOpLayout = mlir::dyn_cast<DotOperandEncodingAttr>(layout);
   if (!dotOpLayout)
     return elemTy;
-  auto mmaParent = dotOpLayout.getParent().dyn_cast<NvidiaMmaEncodingAttr>();
+  auto mmaParent =
+      mlir::dyn_cast<NvidiaMmaEncodingAttr>(dotOpLayout.getParent());
   if (!mmaParent || mmaParent.isHopper())
     return elemTy;
   int bitwidth = elemTy.getIntOrFloatBitWidth();
@@ -86,16 +88,17 @@ Type TritonGPUToLLVMTypeConverter::getElementTypeForStruct(
 }
 
 Type TritonGPUToLLVMTypeConverter::convertTritonTensorType(
-    RankedTensorType type) {
+    RankedTensorType type, const TargetInfoBase &targetInfo) {
   auto ctx = type.getContext();
   Attribute layout = type.getEncoding();
   SmallVector<int64_t> shape(type.getShape().begin(), type.getShape().end());
   Type eltType = getElementTypeForStruct(cast<TensorOrMemDesc>(type));
 
-  if (auto shared_layout = layout.dyn_cast<SharedEncodingAttr>()) {
+  if (auto shared_layout = mlir::dyn_cast<SharedEncodingAttr>(layout)) {
     SmallVector<Type, 4> types;
     // base ptr
-    auto ptrType = LLVM::LLVMPointerType::get(ctx, 3);
+    auto ptrType =
+        LLVM::LLVMPointerType::get(ctx, targetInfo.getSharedAddressSpace());
     types.push_back(ptrType);
     // shape dims
     auto rank = type.getRank();
@@ -111,13 +114,15 @@ Type TritonGPUToLLVMTypeConverter::convertTritonTensorType(
   return LLVM::LLVMStructType::getLiteral(ctx, types);
 }
 
-Type TritonGPUToLLVMTypeConverter::convertMemDescType(MemDescType type) {
+Type TritonGPUToLLVMTypeConverter::convertMemDescType(
+    MemDescType type, const TargetInfoBase &targetInfo) {
   auto ctx = type.getContext();
   Attribute layout = type.getEncoding();
   SmallVector<int64_t> shape(type.getShape().begin(), type.getShape().end());
   SmallVector<Type, 4> types;
   // base ptr
-  auto ptrType = LLVM::LLVMPointerType::get(ctx, 3);
+  auto ptrType =
+      LLVM::LLVMPointerType::get(ctx, targetInfo.getSharedAddressSpace());
   types.push_back(ptrType);
   // shape dims
   auto rank = type.getShape().size();

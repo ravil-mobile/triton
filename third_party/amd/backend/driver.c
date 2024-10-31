@@ -40,7 +40,9 @@ static const char *hipLibSearchPaths[] = {"/*py_libhip_search_path*/"};
                   unsigned int numOptions, hipJitOption *options,              \
                   void **optionValues)                                         \
   FOR_EACH_ERR_FN(hipModuleGetFunction, hipFunction_t *function,               \
-                  hipModule_t module, const char *kname)
+                  hipModule_t module, const char *kname)                       \
+  FOR_EACH_ERR_FN(hipFuncGetAttribute, int *, hipFunction_attribute attr,      \
+                  hipFunction_t function)
 
 // The HIP symbol table for holding resolved dynamic library symbols.
 struct HIPSymbolTable {
@@ -129,12 +131,13 @@ static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
   HIP_CHECK(hipSymbolTable.hipGetDeviceProperties(&props, device_id));
 
   // create a struct to hold device properties
-  return Py_BuildValue("{s:i, s:i, s:i, s:i, s:i, s:s, s:i}", "max_shared_mem",
-                       props.sharedMemPerBlock, "multiprocessor_count",
-                       props.multiProcessorCount, "sm_clock_rate",
-                       props.clockRate, "mem_clock_rate", props.memoryClockRate,
-                       "mem_bus_width", props.memoryBusWidth, "arch",
-                       props.gcnArchName, "warpSize", props.warpSize);
+  return Py_BuildValue(
+      "{s:i, s:i, s:i, s:i, s:i, s:i, s:s, s:i, s:i}", "max_shared_mem",
+      props.sharedMemPerBlock, "max_num_regs", props.regsPerBlock,
+      "multiprocessor_count", props.multiProcessorCount, "sm_clock_rate",
+      props.clockRate, "mem_clock_rate", props.memoryClockRate, "mem_bus_width",
+      props.memoryBusWidth, "arch", props.gcnArchName, "warpSize",
+      props.warpSize, "max_threads_per_sm", props.maxThreadsPerMultiProcessor);
 }
 
 static PyObject *loadBinary(PyObject *self, PyObject *args) {
@@ -169,6 +172,10 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
   // get allocated registers and spilled registers from the function
   int n_regs = 0;
   int n_spills = 0;
+  hipSymbolTable.hipFuncGetAttribute(&n_regs, HIP_FUNC_ATTRIBUTE_NUM_REGS, fun);
+  hipSymbolTable.hipFuncGetAttribute(&n_spills,
+                                     HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fun);
+  n_spills /= 4;
   if (PyErr_Occurred()) {
     return NULL;
   }

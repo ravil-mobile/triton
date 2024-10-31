@@ -90,16 +90,18 @@ public:
     Value ptr = stOp.getPtr();
     Value val = stOp.getValue();
     Value mask = stOp.getMask();
-    auto ptrType = ptr.getType().dyn_cast<RankedTensorType>();
-    auto valType = val.getType().dyn_cast<RankedTensorType>();
+    auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
+    auto valType = dyn_cast<RankedTensorType>(val.getType());
     if (!ptrType || !valType ||
-        !ptrType.getEncoding().isa<triton::gpu::BlockedEncodingAttr>() ||
-        !valType.getEncoding().isa<triton::gpu::BlockedEncodingAttr>())
+        !isa<triton::gpu::BlockedEncodingAttr>(ptrType.getEncoding()) ||
+        !isa<triton::gpu::BlockedEncodingAttr>(valType.getEncoding()))
       return mlir::failure();
 
     llvm::SmallVector<mlir::Operation *> chainedOps;
     while (true) {
       auto chainedOp = val.getDefiningOp();
+      if (!chainedOp)
+        return mlir::failure();
       if (llvm::isa<triton::gpu::ConvertLayoutOp>(chainedOp))
         break;
       if (!chainedOp->hasOneUse())
@@ -110,19 +112,19 @@ public:
       chainedOps.push_back(chainedOp);
     }
 
-    auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(val.getDefiningOp());
+    auto cvtOp = val.getDefiningOp<triton::gpu::ConvertLayoutOp>();
     if (!cvtOp)
       return mlir::failure();
 
     auto encoding = cvtOp.getSrc().getType().getEncoding();
-    if (!encoding.isa<triton::gpu::MmaEncodingTrait>())
+    if (!isa<triton::gpu::MmaEncodingTrait>(encoding))
       return mlir::failure();
 
     if (!cvtOp.getResult().hasOneUse())
       return mlir::failure();
 
     auto newEncoding =
-        cvtOp.getSrc().getType().cast<RankedTensorType>().getEncoding();
+        cast<RankedTensorType>(cvtOp.getSrc().getType()).getEncoding();
 
     auto newVal = cvtOp.getSrc();
 
@@ -133,7 +135,7 @@ public:
 
     for (auto chainedOp : llvm::reverse(chainedOps)) {
       auto oldType =
-          chainedOp->getResult(0).getType().cast<mlir::RankedTensorType>();
+          cast<mlir::RankedTensorType>(chainedOp->getResult(0).getType());
       chainedOp->setOperand(0, newVal);
       newVal = llvm::cast<mlir::TypedValue<RankedTensorType>>(
           chainedOp->getResult(0));
@@ -144,7 +146,7 @@ public:
 
     Value newMask = mask;
     if (mask) {
-      auto maskType = mask.getType().dyn_cast<RankedTensorType>();
+      auto maskType = dyn_cast<RankedTensorType>(mask.getType());
       auto newMaskType = RankedTensorType::get(
           maskType.getShape(), maskType.getElementType(), newEncoding);
       newMask = rewriter.create<triton::gpu::ConvertLayoutOp>(

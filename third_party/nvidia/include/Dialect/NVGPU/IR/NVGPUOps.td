@@ -79,36 +79,12 @@ def WGMMA_EltTypeAttr : I32EnumAttr<"WGMMAEltType",
 def WGMMA_OperandType : AnyTypeOf<[LLVM_AnyStruct, I64], "wgmma operand A/B type">;
 
 def NVGPU_WGMMAOp : NVGPU_Op<"wgmma", []> {
-  let arguments = (ins WGMMA_OperandType:$opA, WGMMA_OperandType:$opB, Optional<LLVM_AnyStruct>:$opC,
+  let arguments = (ins WGMMA_OperandType:$opA, WGMMA_OperandType:$opB, I1:$useC, Optional<LLVM_AnyStruct>:$opC,
                    I32Attr:$m, I32Attr:$n, I32Attr:$k,
                    WGMMA_EltTypeAttr:$eltTypeC, WGMMA_EltTypeAttr:$eltTypeA, WGMMA_EltTypeAttr:$eltTypeB,
                    WGMMA_LayoutAttr:$layoutA, WGMMA_LayoutAttr:$layoutB);
   let results = (outs LLVM_AnyStruct:$res);
-  let assemblyFormat = "$opA `,` $opB (`,` $opC^)? attr-dict `:` functional-type(operands, $res)";
-}
-
-def NVGPU_LoadDSmemOp : NVGPU_Op<"load_dsmem", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins LLVM_AnyPointer:$addr, I32:$ctaId, I32Attr:$bitwidth, I32Attr:$vec);
-  let builders = [
-      OpBuilder<(ins "Type":$resultTy, "Value":$addr, "Value":$ctaId)>,
-      OpBuilder<(ins "Value":$addr, "Value":$ctaId, "unsigned":$bitwidth, "unsigned":$vec)>,
-      OpBuilder<(ins "Value":$addr, "Value":$ctaId, "unsigned":$bitwidth)>
-  ];
-  let results = (outs LLVM_LoadableType:$result);
-  let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
-}
-
-def NVGPU_StoreDSmemOp : NVGPU_Op<"store_dsmem", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins LLVM_AnyPointer:$addr, I32:$ctaId,
-                       Variadic<LLVM_LoadableType>:$values, I1:$pred);
-  let builders = [
-      OpBuilder<(ins "Value":$addr, "Value":$ctaId, "Value":$value, "Value":$pred)>,
-  ];
-  let assemblyFormat = "operands attr-dict `:` type(operands)";
-  let extraClassDeclaration = [{
-      unsigned getBitwidth();
-      unsigned getVec();
-  }];
+  let assemblyFormat = "$opA `,` $opB `,` $useC (`,` $opC^)? attr-dict `:` functional-type(operands, $res)";
 }
 
 def NVGPU_FenceAsyncSharedOp : NVGPU_Op<"fence_async_shared", []> {

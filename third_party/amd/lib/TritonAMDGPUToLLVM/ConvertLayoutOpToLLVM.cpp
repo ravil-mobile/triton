@@ -41,17 +41,20 @@ public:
     RankedTensorType dstTy = op.getType();
     Attribute srcLayout = srcTy.getEncoding();
     Attribute dstLayout = dstTy.getEncoding();
-    if (dstLayout.isa<DotOperandEncodingAttr>() &&
-        dstLayout.cast<DotOperandEncodingAttr>()
-            .getParent()
-            .isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>()) {
+    if (isa<DotOperandEncodingAttr>(dstLayout) &&
+        isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(
+            cast<DotOperandEncodingAttr>(dstLayout).getParent())) {
       return lowerSharedToDotOperand(op, adaptor, getTypeConverter(), rewriter);
     }
     return failure();
   }
 
 private:
-  // shared -> dot_operand if the result layout is mfma
+  /// Lower ttg.local_load in dot operand layout if the operand parent layout is
+  /// MFMA or WMMA.
+  ///
+  /// \returns value with packed loaded values or empty value if this local_load
+  /// is not supproted.
   Value lowerSharedToDotOperandMMA(
       triton::gpu::LocalLoadOp op, triton::gpu::LocalLoadOpAdaptor adaptor,
       const LLVMTypeConverter *typeConverter,
@@ -61,15 +64,15 @@ private:
     Value src = op.getSrc();
     Value dst = op.getResult();
     auto llvmElemTy = typeConverter->convertType(
-        src.getType().cast<MemDescType>().getElementType());
+        cast<MemDescType>(src.getType()).getElementType());
 
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
     Value res;
     auto dopOpParent = dotOperandLayout.getParent();
     if (!isOuter &&
-        dopOpParent.isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>()) {
-      auto sharedToDotConvert = dopOpParent.isa<AMDMfmaEncodingAttr>()
+        isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(dopOpParent)) {
+      auto sharedToDotConvert = isa<AMDMfmaEncodingAttr>(dopOpParent)
                                     ? SharedToDotOperandMFMA::convertLayout
                                     : SharedToDotOperandWMMA::convertLayout;
       res = sharedToDotConvert(dotOperandLayout.getOpIdx(), rewriter, loc, src,
@@ -90,11 +93,11 @@ private:
     auto loc = op.getLoc();
     Value src = op.getSrc();
     Value dst = op.getResult();
-    auto dstTensorTy = dst.getType().cast<RankedTensorType>();
-    auto srcTensorTy = src.getType().cast<MemDescType>();
+    auto dstTensorTy = cast<RankedTensorType>(dst.getType());
+    auto srcTensorTy = cast<MemDescType>(src.getType());
     auto dotOperandLayout =
-        dstTensorTy.getEncoding().cast<DotOperandEncodingAttr>();
-    auto sharedLayout = srcTensorTy.getEncoding().cast<SharedEncodingAttr>();
+        cast<DotOperandEncodingAttr>(dstTensorTy.getEncoding());
+    auto sharedLayout = cast<SharedEncodingAttr>(srcTensorTy.getEncoding());
 
     bool isOuter{};
     int K{};
@@ -105,61 +108,13 @@ private:
     isOuter = K == 1;
     Value res = lowerSharedToDotOperandMMA(op, adaptor, typeConverter, rewriter,
                                            dotOperandLayout, isOuter);
+    if (!res)
+      return failure();
     rewriter.replaceOp(op, res);
     return success();
   }
 };
 
-struct ConvertLayoutOpConversion
-    : public ConvertOpToLLVMPattern<triton::gpu::ConvertLayoutOp> {
-public:
-  using ConvertOpToLLVMPattern<
-      triton::gpu::ConvertLayoutOp>::ConvertOpToLLVMPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Value src = op.getSrc();
-    Value dst = op.getResult();
-    auto srcTy = src.getType().cast<RankedTensorType>();
-    auto dstTy = dst.getType().cast<RankedTensorType>();
-    Attribute srcLayout = srcTy.getEncoding();
-    Attribute dstLayout = dstTy.getEncoding();
-
-    if (srcLayout.isa<AMDMfmaEncodingAttr>() &&
-        dstLayout.isa<DotOperandEncodingAttr>()) {
-      return lowerMfmaToDotOperand(op, adaptor, rewriter);
-    }
-    return failure();
-  }
-
-private:
-  LogicalResult
-  lowerMfmaToDotOperand(triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
-                        ConversionPatternRewriter &rewriter) const {
-    auto loc = op.getLoc();
-    RankedTensorType srcTy = op.getSrc().getType();
-    RankedTensorType dstTy = op.getType();
-    if (isMfmaToDotShortcut(srcTy, dstTy)) {
-      // vecSize is an number of sequential elements stored by one thread
-      // - For MFMA encoding (encoding of the result tensor of dot
-      // operation) it is 4
-      // - For MFMA operand encoding it is
-      // dotOperandEncoding::kWidth,
-      //   which is 4 in certain cases (e.g. fp16 and bfloat16 dtypes with kpack
-      //   = 1)
-      //
-      // For cases where these two values are equal MFMA and MFMA operand
-      // layouts are the same.
-      auto vals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-      Value view =
-          packLLElements(loc, getTypeConverter(), vals, rewriter, dstTy);
-      rewriter.replaceOp(op, view);
-      return success();
-    }
-    return failure();
-  }
-};
 } // namespace
 
 namespace mlir::triton::AMD {
@@ -167,9 +122,6 @@ void populateConvertLayoutOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, int numWarps,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, PatternBenefit benefit) {
-  patterns.add<ConvertLayoutOpConversion>(typeConverter, benefit);
   patterns.add<LocalLoadOpConversion>(typeConverter, benefit);
-  mlir::triton::populateConvertLayoutOpToLLVMPatterns(typeConverter, targetInfo,
-                                                      patterns, benefit);
 }
 } // namespace mlir::triton::AMD

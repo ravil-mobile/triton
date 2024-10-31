@@ -1,3 +1,4 @@
+#include "mlir/Support/LLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 using ValueTable = std::map<std::pair<int, int>, Value>;
@@ -11,7 +12,6 @@ using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::getSizePerThread;
 using ::mlir::triton::gpu::getTotalElemsPerThread;
-using ::mlir::triton::gpu::isaDistributedLayout;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 
 SmallVector<Value>
@@ -92,7 +92,7 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
                Location loc, const LLVMTypeConverter *typeConverter,
                ConversionPatternRewriter &rewriter) {
   auto aTensorTy = cast<MemDescType>(A.getType());
-  auto aLayout = aTensorTy.getEncoding().cast<SharedEncodingAttr>();
+  auto aLayout = cast<SharedEncodingAttr>(aTensorTy.getEncoding());
   auto aShapePerCTA = getShapePerCTA(aTensorTy);
 
   auto aOrder = aLayout.getOrder();
@@ -131,7 +131,7 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
   }
   auto elemTy = typeConverter->convertType(aTensorTy.getElementType());
 
-  Type ptrTy = ptr_ty(rewriter.getContext(), 3);
+  Type ptrTy = aSmem.base.getType();
   SmallVector<Value> aPtrs(aNumPtr);
   for (int i = 0; i < aNumPtr; ++i)
     aPtrs[i] = gep(ptrTy, elemTy, aSmem.base, aOff[i]);
@@ -158,7 +158,7 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
                Location loc, const LLVMTypeConverter *typeConverter,
                ConversionPatternRewriter &rewriter) {
   auto bTensorTy = cast<MemDescType>(B.getType());
-  auto bLayout = bTensorTy.getEncoding().cast<SharedEncodingAttr>();
+  auto bLayout = cast<SharedEncodingAttr>(bTensorTy.getEncoding());
   auto bShapePerCTA = getShapePerCTA(bTensorTy);
 
   auto bOrder = bLayout.getOrder();
@@ -197,7 +197,7 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
   }
   auto elemTy = typeConverter->convertType(bTensorTy.getElementType());
 
-  Type ptrTy = ptr_ty(rewriter.getContext(), 3);
+  Type ptrTy = bSmem.base.getType();
   SmallVector<Value> bPtrs(bNumPtr);
   for (int i = 0; i < bNumPtr; ++i)
     bPtrs[i] = gep(ptrTy, elemTy, bSmem.base, bOff[i]);

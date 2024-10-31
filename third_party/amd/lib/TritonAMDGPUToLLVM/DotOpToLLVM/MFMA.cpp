@@ -20,12 +20,10 @@
  * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-#ifdef USE_ROCM
-
 #include "../PatternTritonGPUOpToLLVM.h"
+#include "../TritonAMDGPUToLLVM/SchedInstructions.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "Utility.h"
-
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 
 using namespace mlir;
@@ -73,7 +71,7 @@ struct DotOpMFMAConversionHelper {
   }
 
   int getNumSubmatrices(Type elementType, int mDim, int nDim) const {
-    if (mDim == 64 && nDim == 4 || mDim == 4 && nDim == 64)
+    if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64))
       return 1;
     assert(mDim == nDim);
     switch (mDim) {
@@ -100,10 +98,10 @@ struct DotOpMFMAConversionHelper {
            "numSubBlocks in not pow 2!");
     if (numSubBlocks == 1)
       return acc;
-    constexpr int waveSize = 64;
-    int subBlockSize = waveSize / numSubBlocks;
+    constexpr int warpSize = 64;
+    int subBlockSize = warpSize / numSubBlocks;
     Value laneId = getThreadId();
-    laneId = and_(laneId, i32_val(waveSize - 1));
+    laneId = and_(laneId, i32_val(warpSize - 1));
     auto vecTy = dyn_cast<VectorType>(acc.getType());
     auto elemType = vecTy.getElementType();
     assert(elemType.getIntOrFloatBitWidth() == 32);
@@ -113,7 +111,7 @@ struct DotOpMFMAConversionHelper {
       accScalar[i] = extract_element(elemType, acc, i32_val(i));
 
     if (reduceSubBlocks) {
-      while (subBlockSize < waveSize) {
+      while (subBlockSize < warpSize) {
         for (int i = 0; i < numScalars; ++i) {
           Value other_acc =
               shuffleXor(loc, rewriter, accScalar[i], subBlockSize);
@@ -153,9 +151,9 @@ struct DotOpMFMAConversionHelper {
 
   /// @brief Zeroes out redundant values in all sub-blocks except first one
   ///
-  /// Every wave in mfma 4x4 layout holds only 4 unique values(scalar or
+  /// Every warp in mfma 4x4 layout holds only 4 unique values(scalar or
   /// vectors) in blocks of 4 consecutive threads, There are 16 copies of these
-  /// 4 values across all threads of the wave. Need to zero out 15 copies to use
+  /// 4 values across all threads of the warp. Need to zero out 15 copies to use
   /// accumulator between dot operations.
   /// @param numSubBlocks
   /// @param acc
@@ -176,9 +174,9 @@ struct DotOpMFMAConversionHelper {
     Value a = op.getA();
     Value b = op.getB();
     Value d = op.getD();
-    auto aTensorTy = a.getType().cast<RankedTensorType>();
-    auto bTensorTy = b.getType().cast<RankedTensorType>();
-    auto dTensorTy = d.getType().cast<RankedTensorType>();
+    auto aTensorTy = cast<RankedTensorType>(a.getType());
+    auto bTensorTy = cast<RankedTensorType>(b.getType());
+    auto dTensorTy = cast<RankedTensorType>(d.getType());
     auto elemTyA = aTensorTy.getElementType();
     auto elemTyB = bTensorTy.getElementType();
 
@@ -191,15 +189,13 @@ struct DotOpMFMAConversionHelper {
     mfmaInsnName = maybeMfmaInsn->getInsnName();
     unsigned kBase = maybeMfmaInsn->getKBase();
 
-    auto aEncoding = aTensorTy.getEncoding().cast<DotOperandEncodingAttr>();
-    auto bEncoding = bTensorTy.getEncoding().cast<DotOperandEncodingAttr>();
+    auto aEncoding = cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
+    auto bEncoding = cast<DotOperandEncodingAttr>(bTensorTy.getEncoding());
     int kWidth = aEncoding.getKWidth();
     auto rank = aTensorTy.getShape().size();
 
-    auto repA =
-        mfmaLayout.getMFMARepForOperands(aTensorTy.getShape(), kWidth, 0);
-    auto repB =
-        mfmaLayout.getMFMARepForOperands(bTensorTy.getShape(), kWidth, 1);
+    auto repA = mfmaLayout.getRepForOperand(aTensorTy.getShape(), kWidth, 0);
+    auto repB = mfmaLayout.getRepForOperand(bTensorTy.getShape(), kWidth, 1);
 
     assert(repA[2] == repB[1]);
 
@@ -265,6 +261,14 @@ struct DotOpMFMAConversionHelper {
     Type structTy = LLVM::LLVMStructType::getLiteral(
         ctx, SmallVector<Type>(fc.size(), dstElemTy));
     Value res = packLLElements(loc, typeConverter, fc, rewriter, structTy);
+
+    Type elemtTy = elemTyA;
+    const size_t mmaCount =
+        numRepB * numRepM * numRepN * numRepK * kWidth / kBase;
+    setNumGeneratedMMAs(op, mmaCount, maybeMfmaInsn->getMDim(),
+                        maybeMfmaInsn->getNDim(), maybeMfmaInsn->getKDim(),
+                        elemtTy);
+
     rewriter.replaceOp(op, res);
 
     return success();
@@ -280,11 +284,18 @@ struct DotOpMFMAConversionHelper {
     int kpack = kWidth / kBase;
     SmallVector<Value> results;
     auto vecTy = vec_ty(type, kBase);
+    if (type.isBF16())
+      vecTy = vec_ty(i16_ty, kBase);
     for (int k = 0; k < kpack; ++k) {
       Value vec = undef(vecTy);
       for (int elemId = 0; elemId < kBase; ++elemId) {
         auto val = extract_element(type, rawElems, i32_val(elemId + k * kBase));
-        vec = insert_element(vecTy, vec, val, i32_val(elemId));
+        if (type.isBF16()) {
+          // rocdl.mfma.f32.32x32x8bf16.1k calls for input of i16 type
+          auto cast = bitcast(val, i16_ty);
+          vec = insert_element(vecTy, vec, cast, i32_val(elemId));
+        } else
+          vec = insert_element(vecTy, vec, val, i32_val(elemId));
       }
       if (type.getIntOrFloatBitWidth() == 8) {
         if (4 == kBase)
@@ -331,7 +342,7 @@ struct DotOpMFMAConversionHelper {
             if (type.getIntOrFloatBitWidth() == 8) {
               vals = extractOperands(rawElems, kWidth, kBase, i8_ty);
             } else if (type.isBF16()) {
-              vals = extractOperands(rawElems, kWidth, kBase, i16_ty);
+              vals = extractOperands(rawElems, kWidth, kBase, bf16_ty);
             } else {
               assert(type.isF16() && "Unsupported data type");
               vals = extractOperands(rawElems, kWidth, kBase, f16_ty);
@@ -354,16 +365,16 @@ LogicalResult convertMFMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                           const LLVMTypeConverter *typeConverter,
                           ConversionPatternRewriter &rewriter) {
   auto rankedTType = [](Value tensor) {
-    return tensor.getType().cast<RankedTensorType>();
+    return cast<RankedTensorType>(tensor.getType());
   };
 
-  assert(rankedTType(op.getA()).getEncoding().isa<DotOperandEncodingAttr>() &&
-         rankedTType(op.getB()).getEncoding().isa<DotOperandEncodingAttr>() &&
+  assert(isa<DotOperandEncodingAttr>(rankedTType(op.getA()).getEncoding()) &&
+         isa<DotOperandEncodingAttr>(rankedTType(op.getB()).getEncoding()) &&
          "Both $a and %b should be DotOperand layout.");
 
   auto cTensorTy = rankedTType(op.getC());
   auto dTensorTy = rankedTType(op.getD());
-  assert(cTensorTy.getEncoding().isa<AMDMfmaEncodingAttr>() &&
+  assert(isa<AMDMfmaEncodingAttr>(cTensorTy.getEncoding()) &&
          "Currently, we only support $c with a mfma layout.");
 
   assert(cTensorTy.getShape()[0] == dTensorTy.getShape()[0] &&
@@ -371,16 +382,11 @@ LogicalResult convertMFMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
          "DotOp's $c operand should pass the same number of values as $d");
 
   auto loc = op.getLoc();
-  auto mfmaLayout = op.getResult()
-                        .getType()
-                        .cast<RankedTensorType>()
-                        .getEncoding()
-                        .cast<AMDMfmaEncodingAttr>();
+  auto mfmaLayout = cast<AMDMfmaEncodingAttr>(
+      cast<RankedTensorType>(op.getResult().getType()).getEncoding());
 
   DotOpMFMAConversionHelper helper(mfmaLayout, rewriter, typeConverter, loc);
 
   return helper.convertDot(op, adaptor);
 }
 } // namespace mlir::triton::AMD
-
-#endif // ifdef USE_ROCM

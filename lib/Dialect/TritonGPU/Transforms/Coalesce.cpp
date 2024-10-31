@@ -1,24 +1,28 @@
+#include <iterator>
+#include <numeric>
+
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Debug.h"
-#include <iterator>
-#include <numeric>
 
 #define DEBUG_TYPE "tritongpu-coalesce"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-using namespace mlir;
-using namespace mlir::triton;
+namespace mlir {
+namespace triton {
+namespace gpu {
 
-#define GEN_PASS_CLASSES
+#define GEN_PASS_DEF_TRITONGPUCOALESCE
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
-struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
+struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   void
   setCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
                        int numWarps, int threadsPerWarp,
@@ -88,7 +92,6 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
       // in the memory write at the warp level, resulting in worse performance.
       // For loads, we can expect that the gaps won't matter due to the L1
       // cache.
-      unsigned elemNumBits = getElementBitWidth(refTensorType);
       perThread = std::min<int>(
           perThread, getNumElementsPerThread(op, order, axisInfoAnalysis));
     }
@@ -117,7 +120,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     for (auto operand : op->getOperands()) {
       auto tensorType = dyn_cast<RankedTensorType>(operand.getType());
       if (tensorType &&
-          !tensorType.getEncoding().isa<triton::gpu::SharedEncodingAttr>()) {
+          !isa<triton::gpu::SharedEncodingAttr>(tensorType.getEncoding())) {
         Type newType = getNewType(tensorType, encoding);
         newArgs.push_back(builder.create<triton::gpu::ConvertLayoutOp>(
             op->getLoc(), newType, operand));
@@ -162,13 +165,11 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
       Value ptr = getMemAccessPtr(curr);
       if (!ptr)
         return;
-      // We only convert `tensor<tt.ptr<>>` or `tt.ptr<tensor<>>` load/store
-      bool isPtrTensor = false, isTensorPointer = false;
+      // We only convert `tensor<tt.ptr<>>` load/store
+      bool isPtrTensor = false;
       if (auto tensorType = dyn_cast<RankedTensorType>(ptr.getType()))
         isPtrTensor = isa<PointerType>(tensorType.getElementType());
-      if (auto ptrType = dyn_cast<PointerType>(ptr.getType()))
-        isTensorPointer = isa<RankedTensorType>(ptrType.getPointeeType());
-      if (!isPtrTensor && !isTensorPointer)
+      if (!isPtrTensor)
         return;
       auto mod = curr->getParentOfType<ModuleOp>();
       int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
@@ -191,6 +192,6 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   }
 };
 
-std::unique_ptr<Pass> mlir::triton::gpu::createCoalescePass() {
-  return std::make_unique<CoalescePass>();
-}
+} // namespace gpu
+} // namespace triton
+} // namespace mlir

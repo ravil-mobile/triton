@@ -4,6 +4,7 @@
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -14,8 +15,8 @@ namespace triton {
 void LoadOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
-  effects.emplace_back(MemoryEffects::Read::get(), getPtr(),
-                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getPtrMutable(),
+                       triton::GlobalMemory::get());
   if (getIsVolatile())
     effects.emplace_back(MemoryEffects::Write::get(),
                          SideEffects::DefaultResource::get());
@@ -90,12 +91,11 @@ struct CanonicalizeMaskedLoadPattern : public OpRewritePattern<LoadOp> {
     if (!mask)
       return failure();
 
-    auto constantMask =
-        llvm::dyn_cast_or_null<arith::ConstantOp>(mask.getDefiningOp());
+    auto constantMask = mask.getDefiningOp<arith::ConstantOp>();
     if (!constantMask)
       return failure();
 
-    auto splatMask = constantMask.getValue().dyn_cast<SplatElementsAttr>();
+    auto splatMask = mlir::dyn_cast<SplatElementsAttr>(constantMask.getValue());
     if (!splatMask)
       return failure();
 
@@ -158,12 +158,11 @@ struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
     if (!mask)
       return failure();
 
-    auto constantMask =
-        llvm::dyn_cast_or_null<arith::ConstantOp>(mask.getDefiningOp());
+    auto constantMask = mask.getDefiningOp<arith::ConstantOp>();
     if (!constantMask)
       return failure();
 
-    auto splatMask = constantMask.getValue().dyn_cast<SplatElementsAttr>();
+    auto splatMask = mlir::dyn_cast<SplatElementsAttr>(constantMask.getValue());
     if (!splatMask)
       return failure();
 
@@ -223,9 +222,10 @@ LogicalResult TransOp::inferReturnTypes(
       return failure();
     }
   }
-  if (isa<MemDescType>(argTy)) {
-    inferredReturnTypes.push_back(
-        MemDescType::get(retShape, retEltTy, retEncoding));
+  if (auto memDescTy = dyn_cast<MemDescType>(argTy)) {
+    inferredReturnTypes.push_back(MemDescType::get(
+        retShape, retEltTy, retEncoding, memDescTy.getMemorySpace(),
+        memDescTy.getMutableMemory()));
   } else {
     inferredReturnTypes.push_back(
         RankedTensorType::get(retShape, retEltTy, retEncoding));
@@ -269,8 +269,8 @@ DotOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   auto bEnc = cast<TensorOrMemDesc>(operands[1].getType()).getEncoding();
   auto retEnc = accTy.getEncoding();
   if (aEnc) {
-    assert(bEnc);
-    Dialect &dialect = aEnc.getDialect();
+    assert(bEnc && retEnc);
+    Dialect &dialect = retEnc.getDialect();
     auto interface = dyn_cast<DialectInferLayoutInterface>(&dialect);
     if (interface->inferDotOpEncoding(aEnc, 0, retEnc, location).failed())
       return failure();
@@ -294,7 +294,11 @@ LogicalResult DotOp::verify() {
   // Verify that the encodings are valid.
   if (!aEncoding || !bEncoding)
     return emitError("mismatching encoding between A and B operands");
-  Dialect &dialect = aEncoding.getDialect();
+  auto accTy = getC().getType();
+  auto retEnc = accTy.getEncoding();
+  if (!retEnc)
+    return emitError("miss encoding of C operand");
+  Dialect &dialect = retEnc.getDialect();
   auto interface = cast<DialectInferLayoutInterface>(&dialect);
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
@@ -334,8 +338,8 @@ LogicalResult MakeRangeOp::verify() {
 
 //-- ReduceOp --
 static LogicalResult
-inferReduceReturnShape(const RankedTensorType &argTy, const Type &retEltTy,
-                       int axis, SmallVectorImpl<Type> &inferredReturnTypes) {
+inferReduceReturnShape(RankedTensorType argTy, Type retEltTy, int axis,
+                       SmallVectorImpl<Type> &inferredReturnTypes) {
   auto retShape = argTy.getShape().vec();
   retShape.erase(retShape.begin() + axis);
   if (retShape.empty()) {
@@ -542,6 +546,8 @@ OpFoldResult SplatOp::fold(FoldAdaptor adaptor) {
   auto value = adaptor.getSrc();
   if (!value)
     return {};
+  if (!isa<FloatAttr, IntegerAttr>(value))
+    return {};
   auto shapedType = cast<ShapedType>(getType());
   auto ret = SplatElementsAttr::get(shapedType, ArrayRef<Attribute>(value));
   return ret;
@@ -631,7 +637,7 @@ static OpFoldResult foldViewLikeOp(ViewLikeOp op, Attribute value) {
     return {};
 
   auto shapedType = cast<ShapedType>(op.getType());
-  if (auto denseElemsAttr = value.dyn_cast<DenseElementsAttr>()) {
+  if (auto denseElemsAttr = dyn_cast<DenseElementsAttr>(value)) {
     if (denseElemsAttr.isSplat()) {
       return denseElemsAttr.resizeSplat(shapedType);
     } else {
@@ -672,7 +678,7 @@ LogicalResult canonicalizeViewOrBroadcast(OpType op,
 }
 
 LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
-  if (!op.getAllowReorder() || op.getEfficientLayout().has_value())
+  if (!op.getAllowReorder() || op.getEfficientLayout())
     return failure();
   return canonicalizeViewOrBroadcast(op, rewriter);
 }
@@ -748,11 +754,31 @@ OpFoldResult BroadcastOp::fold(FoldAdaptor adaptor) {
   if (!value)
     return {};
 
-  if (auto denseElemsAttr = value.dyn_cast<SplatElementsAttr>()) {
+  if (auto denseElemsAttr = dyn_cast<SplatElementsAttr>(value)) {
     auto shapedType = cast<ShapedType>(getType());
     return denseElemsAttr.resizeSplat(shapedType);
   }
   return {};
+}
+
+LogicalResult BroadcastOp::verify() {
+  auto src = getSrc();
+  auto srcTensorType = cast<RankedTensorType>(src.getType());
+  auto srcShape = srcTensorType.getShape();
+  auto result = getResult();
+  auto resultTensorType = cast<RankedTensorType>(result.getType());
+  auto resultShape = resultTensorType.getShape();
+  if (srcShape.size() != resultShape.size()) {
+    return emitError("rank of source must be same as rank of result");
+  }
+  for (int i = 0; i < srcShape.size(); i++) {
+    if (srcShape[i] != 1 && srcShape[i] != resultShape[i]) {
+      return emitError("Different dimensions at index ")
+             << i << " between source and result.  "
+             << "Broadcast requires the source dimension to be 1.";
+    }
+  }
+  return success();
 }
 
 //-- MakeTensorPtrOp --
@@ -772,6 +798,19 @@ void MakeTensorPtrOp::build(OpBuilder &builder, OperationState &state,
 
   return build(builder, state, result, base, shape, strides, offsets,
                builder.getDenseI32ArrayAttr(order));
+}
+
+//-- AdvanceOp --
+OpFoldResult AdvanceOp::fold(FoldAdaptor adaptor) {
+  // advance(ptr, 0, 0) -> ptr
+  SmallVector<OpFoldResult> rawOffsets = getOffsets();
+  auto offsets = getConstantIntValues(rawOffsets);
+  if (!offsets.has_value())
+    return {};
+  for (int64_t offset : offsets.value())
+    if (offset != 0)
+      return {};
+  return getPtr();
 }
 
 // The following ops, including `call`, `func`, and `return` are copied and
@@ -975,6 +1014,24 @@ void ExternElementwiseOp::getEffects(
                        SideEffects::DefaultResource::get());
   effects.emplace_back(MemoryEffects::Read::get(),
                        SideEffects::DefaultResource::get());
+}
+
+// -- ExperimentalTensormapCreateOp --
+LogicalResult ExperimentalTensormapCreateOp::verify() {
+  auto rank = getBoxDim().size();
+  if (getGlobalDim().size() != rank) {
+    return emitError("Rank mismatch for global dim. Got")
+           << getGlobalDim().size() << " but expected " << rank;
+  }
+  if (getGlobalStride().size() + 1 != rank) {
+    return emitError("Rank mismatch for global stride. Got")
+           << getGlobalStride().size() << " but expected " << rank - 1;
+  }
+  if (getElementStride().size() != rank) {
+    return emitError("Rank mismatch for element stride. Got")
+           << getElementStride().size() << " but expected " << rank;
+  }
+  return success();
 }
 
 } // namespace triton

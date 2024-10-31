@@ -6,9 +6,9 @@ import time
 import inspect
 from typing import Dict
 
-from ..testing import do_bench, do_bench_cudagraph
 from .jit import KernelInterface
-from .errors import OutOfResources
+from .errors import OutOfResources, PTXASError
+from .driver import driver
 
 
 class Autotuner(KernelInterface):
@@ -24,9 +24,10 @@ class Autotuner(KernelInterface):
         pre_hook=None,
         post_hook=None,
         prune_configs_by: Dict = None,
-        warmup=25,
-        rep=100,
+        warmup=None,
+        rep=None,
         use_cuda_graph=False,
+        do_bench=None,
     ):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
@@ -38,7 +39,7 @@ class Autotuner(KernelInterface):
             self.configs = [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
         else:
             self.configs = configs
-        self.key_idx = [arg_names.index(k) for k in key]
+        self.keys = key
         self.cache = {}
         self.arg_names = arg_names
 
@@ -88,13 +89,44 @@ class Autotuner(KernelInterface):
         self.base_fn = fn
         while not inspect.isfunction(self.base_fn):
             self.base_fn = self.base_fn.fn
+
         self.num_warmups = warmup
         self.num_reps = rep
-        import torch
-        self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
-        self.benchmarkig_stream = torch.cuda.Stream() if self.use_cuda_graph else None
+        self.use_cuda_graph = use_cuda_graph
+
+        # If we got explicitly called via the old interface, raise a warning
+        # and proceed with the old behavior.
+        if warmup is not None or rep is not None or use_cuda_graph:
+            import warnings
+            warnings.warn(("warmup, rep, and use_cuda_graph parameters are deprecated. See "
+                           "https://github.com/triton-lang/triton/pull/4496 for details."), DeprecationWarning,
+                          stacklevel=1)
+            if use_cuda_graph:
+                from ..testing import do_bench_cudagraph
+                self.do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
+                    kernel_call,
+                    rep=rep if rep is not None else 100,
+                    quantiles=quantiles,
+                )
+                return
+
+            import triton.testing
+            self.do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
+                kernel_call,
+                warmup=warmup if warmup is not None else 25,
+                rep=rep if rep is not None else 100,
+                quantiles=quantiles,
+            )
+            return
+
+        if do_bench is None:
+            self.do_bench = driver.active.get_benchmarker()
+        else:
+            self.do_bench = do_bench
 
     def _bench(self, *args, config, **meta):
+        from ..compiler.errors import CompileTimeAssertionFailure
+
         # check for conflicts, i.e. meta-parameters both provided
         # as kwargs and by the autotuner
         conflicts = meta.keys() & config.kwargs.keys()
@@ -102,7 +134,7 @@ class Autotuner(KernelInterface):
             raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
-        current = dict(meta, **config.kwargs)
+        current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
         def kernel_call():
@@ -112,9 +144,6 @@ class Autotuner(KernelInterface):
             try:
                 self.fn.run(
                     *args,
-                    num_warps=config.num_warps,
-                    num_stages=config.num_stages,
-                    num_ctas=config.num_ctas,
                     **current,
                 )
             except Exception as e:
@@ -127,26 +156,18 @@ class Autotuner(KernelInterface):
             self.post_hook(args, exception=None)
 
         try:
-            if self.use_cuda_graph:
-                import torch
-                with torch.cuda.stream(self.benchmarkig_stream):
-                    bench_res = do_bench_cudagraph(kernel_call, rep=self.num_reps, return_mode="median")
-                return bench_res
-            return do_bench(kernel_call, warmup=self.num_warmups, rep=self.num_reps, quantiles=(0.5, 0.2, 0.8))
-        except OutOfResources:
-            return float("inf") if self.use_cuda_graph else [float("inf"), float("inf"), float("inf")]
+            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+        except (OutOfResources, CompileTimeAssertionFailure, PTXASError):
+            return [float("inf"), float("inf"), float("inf")]
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
             all_args = {**self.nargs, **kwargs}
-            _args = []
-            for name in self.arg_names:
-                if name in all_args:
-                    _args.append(all_args[name])
-            key = [_args[i] for i in self.key_idx]
-            for arg in _args:
+            _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
+            key = [_args[key] for key in self.keys if key in _args]
+            for _, arg in _args.items():
                 if hasattr(arg, "dtype"):
                     key.append(str(arg.dtype))
             key = tuple(key)
@@ -168,16 +189,12 @@ class Autotuner(KernelInterface):
         if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
             print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
                   f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
-        full_nargs = {**self.nargs, **kwargs, **self.best_config.kwargs}
         if config.pre_hook is not None:
-            config.pre_hook(full_nargs)
+            config.pre_hook({**self.nargs, **kwargs, **config.all_kwargs()})
         ret = self.fn.run(
             *args,
-            num_warps=config.num_warps,
-            num_stages=config.num_stages,
-            num_ctas=config.num_ctas,
             **kwargs,
-            **config.kwargs,
+            **config.all_kwargs(),
         )
         self.nargs = None
         return ret
@@ -192,14 +209,10 @@ class Autotuner(KernelInterface):
                 top_k = int(len(self.configs) * top_k)
             if len(pruned_configs) > top_k:
                 est_timing = {
-                    config:
-                    self.perf_model(
+                    config: self.perf_model(
                         **self.nargs,
                         **kwargs,
-                        **config.kwargs,
-                        num_stages=config.num_stages,
-                        num_warps=config.num_warps,
-                        num_ctas=config.num_ctas,
+                        **config.all_kwargs(),
                     )
                     for config in pruned_configs
                 }
@@ -210,15 +223,11 @@ class Autotuner(KernelInterface):
         self.nargs = dict(zip(self.arg_names, args))
         ret = []
         for config in self.prune_configs(kwargs):
-            ret.append(
-                self.fn.warmup(
-                    *args,
-                    num_warps=config.num_warps,
-                    num_ctas=config.num_ctas,
-                    num_stages=config.num_stages,
-                    **kwargs,
-                    **config.kwargs,
-                ))
+            ret.append(self.fn.warmup(
+                *args,
+                **kwargs,
+                **config.all_kwargs(),
+            ))
         self.nargs = None
         return ret
 
@@ -237,16 +246,33 @@ class Config:
                        Mostly useful for matrix multiplication workloads on SM80+ GPUs.
     :type num_ctas: int
     :ivar num_ctas: number of blocks in a block cluster. SM90+ only.
+    :type maxnreg: Optional[int]
+    :ivar maxnreg: maximum number of registers one thread can use.  Corresponds
+                       to ptx .maxnreg directive.  Not supported on all platforms.
     :ivar pre_hook: a function that will be called before the kernel is called. Parameters of this
                     function are args.
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=2, num_ctas=1, pre_hook=None):
+    def __init__(self, kwargs, num_warps=4, num_stages=2, num_ctas=1, maxnreg=None, pre_hook=None):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
         self.num_stages = num_stages
+        self.maxnreg = maxnreg
         self.pre_hook = pre_hook
+
+    def all_kwargs(self):
+        return {
+            **self.kwargs, **{
+                k: v
+                for (k, v) in (
+                    ("num_warps", self.num_warps),
+                    ("num_ctas", self.num_ctas),
+                    ("num_stages", self.num_stages),
+                    ("maxnreg", self.maxnreg),
+                ) if v is not None
+            }
+        }
 
     def __str__(self):
         res = []
@@ -255,11 +281,12 @@ class Config:
         res.append(f"num_warps: {self.num_warps}")
         res.append(f"num_ctas: {self.num_ctas}")
         res.append(f"num_stages: {self.num_stages}")
+        res.append(f"maxnreg: {self.maxnreg}")
         return ", ".join(res)
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=25, rep=100, use_cuda_graph=False):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -307,10 +334,12 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         'args': a list of arguments passed to the kernel.
         'exception': the exception raised by the kernel in case of a compilation or runtime error.
     :type post_hook: lambda args, exception
-    :param warmup: Warmup time (in ms) to pass to benchmarking, defaults to 25.
+    :param warmup: warmup time (in ms) to pass to benchmarking (deprecated).
     :type warmup: int
-    :param rep: Repetition time (in ms) to pass to benchmarking, defaults to 100.
+    :param rep: repetition time (in ms) to pass to benchmarking (deprecated).
     :type rep: int
+    :param do_bench: a benchmark function to measure the time of each run.
+    :type do_bench: lambda fn, quantiles
     """
 
     def decorator(fn):

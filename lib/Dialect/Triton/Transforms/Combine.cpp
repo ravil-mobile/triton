@@ -1,15 +1,15 @@
+#include <memory>
+
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
-
-#include <memory>
 
 #define GEN_PASS_CLASSES
 #include "triton/Dialect/Triton/Transforms/Passes.h.inc"
@@ -30,17 +30,17 @@ bool isZero(Value val) {
 }
 
 bool isBroadcastConstantCombinable(Attribute value) {
-  if (auto denseValue = value.dyn_cast<DenseElementsAttr>()) {
+  if (auto denseValue = dyn_cast<DenseElementsAttr>(value)) {
     return denseValue.isSplat();
   }
-  return value.isa<FloatAttr, IntegerAttr>();
+  return isa<FloatAttr, IntegerAttr>(value);
 }
 
 DenseElementsAttr getConstantValue(Builder &builder, Attribute value,
                                    Value bcast_res) {
   auto resType = cast<ShapedType>(bcast_res.getType());
   DenseElementsAttr res;
-  if (auto denseValue = value.dyn_cast<DenseElementsAttr>()) {
+  if (auto denseValue = dyn_cast<DenseElementsAttr>(value)) {
     res =
         DenseElementsAttr::get(resType, denseValue.getSplatValue<Attribute>());
   } else {
@@ -113,8 +113,7 @@ public:
     Value falseValue = selectOp.getFalseValue();
     Value condSelect = selectOp.getCondition();
 
-    auto *loadOpCandidate = trueValue.getDefiningOp();
-    auto loadOp = llvm::dyn_cast_or_null<LoadOp>(loadOpCandidate);
+    auto loadOp = trueValue.getDefiningOp<LoadOp>();
     if (!loadOp)
       return failure();
 
@@ -122,8 +121,7 @@ public:
     if (!mask)
       return failure();
 
-    auto *splatOpCandidate = mask.getDefiningOp();
-    auto splatOp = llvm::dyn_cast_or_null<SplatOp>(splatOpCandidate);
+    auto splatOp = mask.getDefiningOp<SplatOp>();
     if (!splatOp)
       return failure();
 
@@ -175,26 +173,21 @@ public:
     if (!isReduceAdd)
       return failure();
     // operand of reduce has to be mul
-    auto mulOp = llvm::dyn_cast_or_null<arith::MulFOp>(
-        reduceOp.getOperand(0).getDefiningOp());
+    auto mulOp = reduceOp.getOperand(0).getDefiningOp<arith::MulFOp>();
     if (!mulOp)
       return failure();
     // mul operand has to be broadcast
-    auto broadcastLhsOp = llvm::dyn_cast_or_null<BroadcastOp>(
-        mulOp.getOperand(0).getDefiningOp());
+    auto broadcastLhsOp = mulOp.getOperand(0).getDefiningOp<BroadcastOp>();
     if (!broadcastLhsOp)
       return failure();
-    auto broadcastRhsOp = llvm::dyn_cast_or_null<BroadcastOp>(
-        mulOp.getOperand(1).getDefiningOp());
+    auto broadcastRhsOp = mulOp.getOperand(1).getDefiningOp<BroadcastOp>();
     if (!broadcastRhsOp)
       return failure();
     // broadcast operand is expand dims
-    auto expandLhsOp = llvm::dyn_cast_or_null<ExpandDimsOp>(
-        broadcastLhsOp.getSrc().getDefiningOp());
+    auto expandLhsOp = broadcastLhsOp.getSrc().getDefiningOp<ExpandDimsOp>();
     if (!expandLhsOp)
       return failure();
-    auto expandRhsOp = llvm::dyn_cast_or_null<ExpandDimsOp>(
-        broadcastRhsOp.getSrc().getDefiningOp());
+    auto expandRhsOp = broadcastRhsOp.getSrc().getDefiningOp<ExpandDimsOp>();
     if (!expandRhsOp)
       return failure();
     // get not-broadcast dimensions

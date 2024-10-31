@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include <deque>
 
 namespace mlir {
@@ -86,9 +87,8 @@ void MembarAnalysis::visitTerminator(Operation *op,
     return;
   }
   // Otherwise, it could be a return op
-  if (isa<triton::ReduceReturnOp, triton::ScanReturnOp, triton::ReturnOp>(op)) {
+  if (op->hasTrait<OpTrait::ReturnLike>())
     return;
-  }
   llvm_unreachable("Unknown terminator encountered in membar analysis");
 }
 
@@ -100,15 +100,6 @@ void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncBlockInfoMapT *funcBlockInfoMap,
                             OpBuilder *builder) {
-  if (isa<triton::gpu::LocalDeallocOp, triton::gpu::MemDescSubviewOp,
-          triton::TransOp>(op)) {
-    return;
-  }
-  if (auto alloc = dyn_cast<triton::gpu::LocalAllocOp>(op)) {
-    if (!alloc.getSrc())
-      return;
-  }
-
   if (isa<gpu::BarrierOp>(op)) {
     // If the current op is a barrier, we sync previous reads and writes
     blockInfo->sync();
@@ -126,49 +117,63 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
   }
 
   BlockInfo curBlockInfo;
+  auto scratchBufferId = Allocation::InvalidBufferId;
   if (isa<triton::CallOp>(op)) {
     // Inter-function dependencies
     auto callOpInterface = dyn_cast<CallOpInterface>(op);
     if (auto callee =
-            dyn_cast<FunctionOpInterface>(callOpInterface.resolveCallable())) {
+            dyn_cast<FunctionOpInterface>(callOpInterface.resolveCallable()))
       curBlockInfo = funcBlockInfoMap->lookup(callee);
-    }
   } else {
     // Intra-function dependencies
-    for (Value value : op->getOperands()) {
-      for (auto bufferId : allocation->getBufferIds(value)) {
-        if (bufferId != Allocation::InvalidBufferId) {
-          if (isa<triton::gpu::AsyncCopyGlobalToLocalOp>(op)) {
-            // Global -> shared memory
-            curBlockInfo.syncWriteIntervals.insert(
-                allocation->getAllocatedInterval(bufferId));
-          } else {
-            // ConvertLayoutOp: shared memory -> registers
-            curBlockInfo.syncReadIntervals.insert(
-                allocation->getAllocatedInterval(bufferId));
+    if (auto memoryEffectOpInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
+      // Explicit buffer
+      SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>>
+          effectInstances;
+      memoryEffectOpInterface.getEffects(effectInstances);
+      for (auto effectInstance : effectInstances) {
+        if (auto value = effectInstance.getValue()) {
+          for (auto bufferId : allocation->getBufferIds(value)) {
+            if (bufferId != Allocation::InvalidBufferId) {
+              if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
+                curBlockInfo
+                    .syncWriteIntervals[allocation->getAllocatedInterval(
+                        bufferId)]
+                    .insert(op);
+              else if (isa<MemoryEffects::Read>(effectInstance.getEffect()))
+                curBlockInfo
+                    .syncReadIntervals[allocation->getAllocatedInterval(
+                        bufferId)]
+                    .insert(op);
+            }
           }
         }
       }
     }
-    for (Value value : op->getResults()) {
-      // ConvertLayoutOp: registers -> shared memory
-      auto bufferId = allocation->getBufferId(value);
-      if (bufferId != Allocation::InvalidBufferId) {
-        curBlockInfo.syncWriteIntervals.insert(
-            allocation->getAllocatedInterval(bufferId));
-      }
-    }
-    // Scratch buffer is considered as both shared memory write & read
-    auto bufferId = allocation->getBufferId(op);
-    if (bufferId != Allocation::InvalidBufferId) {
-      curBlockInfo.syncWriteIntervals.insert(
-          allocation->getAllocatedInterval(bufferId));
-      curBlockInfo.syncReadIntervals.insert(
-          allocation->getAllocatedInterval(bufferId));
-    }
+    scratchBufferId = allocation->getBufferId(op);
   }
 
-  if (blockInfo->isIntersected(curBlockInfo)) {
+  // Scratch buffer operations consist of a series of shared memory operations
+  // starting from a shared memory write, followed by a series of shared memory
+  // read/write operations, and ending with a shared memory read, i.e., shared
+  // memory write -> ... -> shared memory read.
+  if (scratchBufferId != Allocation::InvalidBufferId) {
+    if (!curBlockInfo.syncReadIntervals.empty() ||
+        !curBlockInfo.syncWriteIntervals.empty()) {
+      llvm::report_fatal_error(
+          "scratch buffer operations should not have any shared memory "
+          "dependencies");
+    }
+    auto interval = allocation->getAllocatedInterval(scratchBufferId);
+    curBlockInfo.syncWriteIntervals[interval].insert(op);
+    if (blockInfo->isIntersected(curBlockInfo, filter)) {
+      builder->setInsertionPoint(op);
+      insertBarrier(op, builder);
+    }
+    // Ops with a scratch buffer internally syncs read/write on shared memory
+    blockInfo->sync();
+    curBlockInfo.syncReadIntervals[interval].insert(op);
+  } else if (blockInfo->isIntersected(curBlockInfo, filter)) {
     builder->setInsertionPoint(op);
     insertBarrier(op, builder);
     blockInfo->sync();

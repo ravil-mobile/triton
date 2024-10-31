@@ -1,6 +1,3 @@
-#include "PipelineExpander.h"
-#include "PipeliningUtility.h"
-#include "Schedule.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/IRMapping.h"
@@ -14,6 +11,9 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/MapVector.h"
@@ -51,168 +51,11 @@ struct LoadInfo {
 
 } // namespace
 
-class CoarseSchedule {
-public:
-  class ClusterList {
-    std::list<int> orderClusters;
-
-  public:
-    using iterator = decltype(orderClusters)::iterator;
-    ClusterList() = default;
-    iterator begin() { return orderClusters.begin(); }
-    iterator end() { return orderClusters.end(); }
-    size_t size() { return orderClusters.size(); }
-    iterator newAtBack() {
-      orderClusters.push_back(orderClusters.size());
-      return std::prev(orderClusters.end());
-    }
-    iterator newAtFront() {
-      orderClusters.push_front(-1);
-      for (auto &clusterId : orderClusters) {
-        clusterId++;
-      }
-      return orderClusters.begin();
-    }
-    iterator newBefore(iterator cluster) {
-      auto ret = orderClusters.insert(cluster, *cluster);
-      for (auto &clusterId : llvm::make_range(cluster, orderClusters.end())) {
-        clusterId++;
-      }
-      return ret;
-    }
-  };
-
-  CoarseSchedule(int numStages) : numStages(numStages) {}
-  int numStages;
-  ClusterList clusters;
-  using Cluster = decltype(clusters)::iterator;
-
-  DenseMap<Operation *, std::pair<int, Cluster>> opToStageAndCluster;
-
-  void insert(Operation *op, int stage, Cluster cluster) {
-    opToStageAndCluster[op] = {stage, cluster};
-  }
-
-  bool insertIfAbsent(Operation *op, int stage, Cluster cluster) {
-    if (opToStageAndCluster.count(op))
-      return false;
-    insert(op, stage, cluster);
-    return true;
-  }
-
-  void insertDepsOfOp(Operation *op, int stage, CoarseSchedule::Cluster cluster,
-                      bool includeArg) {
-    for (Value operand : op->getOperands()) {
-      Value v = operand;
-      llvm::SmallDenseSet<Value> seen;
-      while (auto arg = v.dyn_cast<BlockArgument>()) {
-        if (!includeArg)
-          break;
-        if (!seen.insert(v).second)
-          break;
-        if (arg.getArgNumber() > 0 && arg.getOwner() == op->getBlock()) {
-          auto yieldOp = op->getBlock()->getTerminator();
-          v = yieldOp->getOperand(arg.getArgNumber() - 1);
-          continue;
-        }
-        break;
-      }
-      Operation *defOp = v.getDefiningOp();
-      if (defOp && defOp->getBlock() == op->getBlock()) {
-        if (insertIfAbsent(defOp, stage, cluster)) {
-          insertDepsOfOp(defOp, stage, cluster, includeArg);
-        }
-      }
-    }
-  }
-
-  void erase(Operation *op) { opToStageAndCluster.erase(op); }
-
-  int count(Operation *op) { return opToStageAndCluster.count(op); }
-
-  std::pair<int, Cluster> operator[](Operation *op) {
-    return opToStageAndCluster[op];
-  }
-
-  SmallVector<std::tuple<Operation *, int, Cluster>>
-  getOpsInOrder(scf::ForOp forOp) {
-    SmallVector<SmallVector<std::tuple<Operation *, int, Cluster>>, 8>
-        orderClusters(clusters.size());
-    for (auto &op : forOp.getBody()->without_terminator()) {
-      if (opToStageAndCluster.count(&op) == 0) {
-        continue;
-      }
-      assert(opToStageAndCluster[&op].first < numStages &&
-             "Op with invalid stage!");
-      int clusterId = *opToStageAndCluster[&op].second;
-      assert(clusterId == std::distance(clusters.begin(),
-                                        opToStageAndCluster[&op].second) &&
-             "Cluster ID mismatch!");
-      orderClusters[clusterId].push_back(
-          make_tuple(&op, opToStageAndCluster[&op].first,
-                     opToStageAndCluster[&op].second));
-    }
-    SmallVector<std::tuple<Operation *, int, Cluster>> opsInOrder;
-    for (int i = 0; i < orderClusters.size(); i++) {
-      for (auto [op, stage, cluster] : orderClusters[i]) {
-        opsInOrder.push_back({op, stage, cluster});
-      }
-    }
-
-    return opsInOrder;
-  }
-
-  std::vector<std::pair<Operation *, unsigned>>
-  createFinalSchedule(scf::ForOp forOp) {
-    SmallVector<std::tuple<Operation *, int, Cluster>> opsInOrder =
-        getOpsInOrder(forOp);
-    std::vector<std::pair<Operation *, unsigned>> schedule;
-    for (auto [op, stage, cluster] : opsInOrder) {
-      LDBG("Adding op to schedule at stage " << stage << " cluster " << *cluster
-                                             << ":" << *op);
-      schedule.push_back({op, stage});
-    }
-    return schedule;
-  }
-
-  void dump() {
-    for (int i = 0; i < numStages; i++) {
-      LDBG("- Ops in stage " << i);
-      for (auto &[op, stageAndCluster] : opToStageAndCluster) {
-        if (i == stageAndCluster.first) {
-          llvm::outs() << " cluster: " << *stageAndCluster.second << " ";
-          op->dump();
-        }
-      }
-    }
-  }
-};
-
-static bool isMMAv3Dot(Operation *op) {
-  auto dot = dyn_cast<tt::DotOp>(op);
-  if (!dot)
-    return false;
-  auto enc = dot.getType().getEncoding().dyn_cast<ttg::NvidiaMmaEncodingAttr>();
-  return enc && enc.isHopper();
-}
-
-// Replace the ForOp's yield with a new one with the given operands appended.
-static void appendToYield(scf::ForOp forOp, ArrayRef<Value> newOperands) {
-  // Fix up the yield op.
-  Operation *yieldOp = forOp.getBody()->getTerminator();
-  SmallVector<Value> operands(yieldOp->getOperands());
-  operands.append(newOperands.begin(), newOperands.end());
-
-  OpBuilder builder(yieldOp);
-  builder.create<scf::YieldOp>(yieldOp->getLoc(), operands);
-  yieldOp->erase();
-}
-
 static void createAsyncCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
                             Value insertIdx, Value extractIdx,
-                            CoarseSchedule &schedule,
-                            CoarseSchedule::Cluster prefetchCluster,
-                            llvm::MapVector<tt::LoadOp, LoadInfo> &loadToInfo,
+                            tt::CoarseSchedule &schedule,
+                            tt::CoarseSchedule::Cluster prefetchCluster,
+                            llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
                             int numStages) {
   OpBuilder builder(forOp);
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
@@ -244,9 +87,11 @@ static void createAsyncCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
   tt::MemDescType allocTy = cast<tt::MemDescType>(alloc.getType());
   SmallVector<Value> copyOffsets(allocTy.getRank(), zero);
   copyOffsets[0] = insertIdx;
+  Attribute sharedMemorySpace =
+      triton::gpu::SharedMemorySpaceAttr::get(forOp.getContext());
   tt::MemDescType subviewTy = tt::MemDescType::get(
       allocTy.getShape().drop_front(), allocTy.getElementType(),
-      allocTy.getEncoding(), /*mutableMemory=*/true);
+      allocTy.getEncoding(), sharedMemorySpace, /*mutableMemory=*/true);
   auto view =
       builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, copyOffsets);
   Operation *copy = builder.create<ttg::AsyncCopyGlobalToLocalOp>(
@@ -270,13 +115,13 @@ static void createAsyncCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
       builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, loadOffsets);
   if (isMMV3Load) {
     auto alloc = cast<ttg::LocalAllocOp>((*loadOp->getUsers().begin()));
-    alloc.replaceAllUsesWith(viewLoad.getResult());
+    replaceUsesAndPropagateType(builder, alloc, viewLoad.getResult());
     alloc.erase();
   } else {
     SmallVector<ttg::LocalAllocOp> allocsToErase;
     for (Operation *user : loadOp->getUsers()) {
       if (auto alloc = dyn_cast<ttg::LocalAllocOp>(user)) {
-        alloc.replaceAllUsesWith(viewLoad.getResult());
+        replaceUsesAndPropagateType(builder, alloc, viewLoad.getResult());
         allocsToErase.push_back(alloc);
       }
     }
@@ -308,12 +153,75 @@ static void createAsyncCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
   loadOp.erase();
 }
 
+static void createTMAAsyncCopy(
+    scf::ForOp &forOp, tt::ExperimentalDescriptorLoadOp loadOp, Value alloc,
+    Value insertIdx, Value extractIdx, Value barrier, Operation *waitOp,
+    Value phase, tt::CoarseSchedule &schedule,
+    llvm::MapVector<Operation *, LoadInfo> &loadToInfo, int numStages) {
+  assert(phase && "Phase value is required for TMA async copy.");
+  OpBuilder builder(forOp);
+  Attribute sharedMemorySpace =
+      triton::gpu::SharedMemorySpaceAttr::get(forOp.getContext());
+  Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
+  builder.setInsertionPoint(loadOp);
+  Location loc = loadOp.getLoc();
+  tt::MemDescType allocTy = cast<tt::MemDescType>(alloc.getType());
+  SmallVector<Value> copyOffsets(allocTy.getRank(), zero);
+  copyOffsets[0] = insertIdx;
+  tt::MemDescType subviewTy = tt::MemDescType::get(
+      allocTy.getShape().drop_front(), allocTy.getElementType(),
+      allocTy.getEncoding(), sharedMemorySpace, /*mutableMemory=*/true);
+  auto view =
+      builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, copyOffsets);
+
+  Value pred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
+  Operation *copy = builder.create<ttng::AsyncTMACopyGlobalToLocalOp>(
+      loc, loadOp.getDescPtr(), loadOp.getIndices(), barrier, view, pred);
+
+  bool isMMV3Load = loadToInfo[loadOp].loadIsMMAV3;
+  auto [stage, cluster] = schedule[loadOp];
+  schedule.erase(loadOp);
+  schedule.insert(copy, stage, cluster);
+
+  builder.setInsertionPointAfter(waitOp);
+  // Extract part.
+  SmallVector<Value> loadOffsets(allocTy.getRank(), zero);
+  loadOffsets[0] = extractIdx;
+  auto viewLoad =
+      builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, loadOffsets);
+  if (isMMV3Load) {
+    auto alloc = cast<ttg::LocalAllocOp>((*loadOp->getUsers().begin()));
+    replaceUsesAndPropagateType(builder, alloc, viewLoad.getResult());
+    alloc.erase();
+  } else {
+    SmallVector<ttg::LocalAllocOp> allocsToErase;
+    for (Operation *user : loadOp->getUsers()) {
+      if (auto alloc = dyn_cast<ttg::LocalAllocOp>(user)) {
+        replaceUsesAndPropagateType(builder, alloc, viewLoad.getResult());
+        allocsToErase.push_back(alloc);
+      }
+    }
+    for (auto alloc : allocsToErase) {
+      alloc.erase();
+    }
+
+    auto sharedLoad = builder.create<ttg::LocalLoadOp>(
+        loc, loadOp.getType(), viewLoad /*,wait->getResult(0)*/);
+    auto result = sharedLoad->getResults();
+    loadOp->replaceAllUsesWith(result);
+  }
+  loadOp.erase();
+}
+
 // If all the transitive uses of the given value have are used by a convert to
-// the same dot operand encoding, return true and get the shared encoding that
-// needs to be used to be compatible with users' layouts.
+// the same dot operand encoding, return the shared encoding that needs to be
+// used to be compatible with users' layouts. If there are imcompatible shared
+// encodings, raise assertion, since incompatible shared encoding has been
+// handled in splitLoadsForIncompatible.
 static std::optional<ttg::SharedEncodingAttr>
-getSharedEncIfAllUsersAreDotEnc(Value val) {
+getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {
   ttg::SharedEncodingAttr attr;
+  incompatible = false;
   for (Operation *user : val.getUsers()) {
     ttg::SharedEncodingAttr tempAttr;
     if (user->getNumResults() != 1)
@@ -322,32 +230,30 @@ getSharedEncIfAllUsersAreDotEnc(Value val) {
             dyn_cast<triton::MemDescType>(user->getResult(0).getType())) {
       // First time we find a shared encoding in the chain, save it and try to
       // use it if it is compatible with the other users.
-      tempAttr = memDesc.getEncoding().cast<ttg::SharedEncodingAttr>();
-      if (!getSharedEncIfAllUsersAreDotEnc(user->getResult(0)).has_value())
+      tempAttr = cast<ttg::SharedEncodingAttr>(memDesc.getEncoding());
+      if (!getSharedEncIfAllUsersAreDotEnc(user->getResult(0), incompatible)
+               .has_value())
         return std::nullopt;
     } else {
       if (!isa<ttg::LocalLoadOp, ttg::ConvertLayoutOp>(user))
         return std::nullopt;
-      auto dotOpEnc = user->getResult(0)
-                          .getType()
-                          .cast<TensorOrMemDesc>()
-                          .getEncoding()
-                          .dyn_cast<ttg::DotOperandEncodingAttr>();
+      auto dotOpEnc = dyn_cast<ttg::DotOperandEncodingAttr>(
+          cast<TensorOrMemDesc>(user->getResult(0).getType()).getEncoding());
       if (!dotOpEnc)
         return std::nullopt;
-      auto srcTy = val.getType().cast<TensorOrMemDesc>();
+      auto srcTy = cast<TensorOrMemDesc>(val.getType());
       auto CTALayout = ttg::getCTALayout(srcTy.getEncoding());
       auto order = ttg::getOrder(srcTy.getEncoding());
       unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
       tempAttr = ttg::SharedEncodingAttr::get(
-          val.getContext(), dotOpEnc, srcTy.getShape(),
-          ttg::getOrder(srcTy.getEncoding()),
-          ttg::getCTALayout(srcTy.getEncoding()),
-          srcTy.getElementType().getIntOrFloatBitWidth(), /*needTrans=*/false);
+          val.getContext(), dotOpEnc, srcTy.getShape(), order, CTALayout,
+          bitWidth, /*needTrans=*/false);
     }
     // Check that the shared encodings needed by the users are compatible.
-    if (!tempAttr || (attr != nullptr && attr != tempAttr))
+    if (attr != nullptr && attr != tempAttr) {
+      incompatible = true;
       return std::nullopt;
+    }
     attr = tempAttr;
   }
   return attr;
@@ -373,8 +279,8 @@ getBlockedEncoding(tt::LoadOp loadOp, tt::ModuleAxisInfoAnalysis &axisInfo) {
 }
 
 static std::optional<ttg::SharedEncodingAttr>
-getSharedEncoding(tt::LoadOp loadOp, bool isMMAV3) {
-  auto ty = cast<RankedTensorType>(loadOp.getType());
+getSharedEncoding(Operation *loadOp, bool isMMAV3) {
+  auto ty = cast<RankedTensorType>(loadOp->getResultTypes()[0]);
   auto ctaLayout = ttg::getCTALayout(ty.getEncoding());
   auto blockedOrder = ttg::getOrder(ty.getEncoding());
   SmallVector<unsigned> order;
@@ -403,8 +309,8 @@ getSharedEncoding(tt::LoadOp loadOp, bool isMMAV3) {
       auto localAlloc = dyn_cast<ttg::LocalAllocOp>(user);
       if (!localAlloc)
         continue;
-      auto enc =
-          localAlloc.getType().getEncoding().cast<ttg::SharedEncodingAttr>();
+      auto enc = mlir::cast<ttg::SharedEncodingAttr>(
+          localAlloc.getType().getEncoding());
       if (!localAllocEnc) {
         localAllocEnc = enc;
       }
@@ -424,9 +330,9 @@ getSharedEncoding(tt::LoadOp loadOp, bool isMMAV3) {
 // final use of the load op (another load op, or a dot op).
 // Indirection level is "0" for the load op directly used by the dot op,
 // "1" for the load op used by the load op used by the dot op, and so on.
-static llvm::SmallVector<std::tuple<tt::LoadOp, int, Operation *>>
+static llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
 loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
-  llvm::SmallVector<std::tuple<tt::LoadOp, int, Operation *>>
+  llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
       loadOpToIndLevelAndUse;
   DenseSet<Operation *> seen;
 
@@ -434,10 +340,9 @@ loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
       [&](Operation *op, int distance, Operation *use) {
         if (!seen.insert(op).second)
           return;
-        if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
+        if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op)) {
           // TODO: What if there are multiple uses at different distances?
-          loadOpToIndLevelAndUse.push_back(
-              std::make_tuple(loadOp, distance, use));
+          loadOpToIndLevelAndUse.push_back(std::make_tuple(op, distance, use));
           use = op;
           distance++;
         }
@@ -451,7 +356,7 @@ loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
       };
 
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    if (!isa<tt::DotOp>(op))
+    if (!op.hasTrait<OpTrait::DotLike>())
       continue;
     seen.clear();
     dfs(&op, 0, &op);
@@ -461,7 +366,7 @@ loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
   // that are not directly used by dot ops.
   if (forOp->hasAttr(tt::kNumStagesAttrName)) {
     for (Operation &op : forOp.getBody()->without_terminator()) {
-      if (!isa<tt::LoadOp>(op))
+      if (!isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op))
         dfs(&op, 0, &op);
     }
   }
@@ -469,20 +374,19 @@ loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
   return loadOpToIndLevelAndUse;
 }
 
-static bool loadIsMMAv3(tt::LoadOp loadOp) {
+static bool loadIsMMAv3(Operation *loadOp) {
   if (!loadOp->hasOneUse())
     return false;
   auto alloc = dyn_cast<ttg::LocalAllocOp>(*loadOp->getUsers().begin());
   if (!alloc)
     return false;
-  auto sharedEnc =
-      alloc.getType().getEncoding().cast<ttg::SharedEncodingAttr>();
+  auto sharedEnc = cast<ttg::SharedEncodingAttr>(alloc.getType().getEncoding());
   if (!sharedEnc.getHasLeadingOffset())
     return false;
 
   // MMA V3 case.
   auto newOrder = sharedEnc.getOrder();
-  auto ty = cast<RankedTensorType>(loadOp.getType());
+  auto ty = cast<RankedTensorType>(loadOp->getResultTypes()[0]);
   auto oldOrder = ttg::getOrder(ty.getEncoding());
 
   // The operand of MMAv3 is in SharedEncoding and its order should not
@@ -492,85 +396,85 @@ static bool loadIsMMAv3(tt::LoadOp loadOp) {
   return oldOrder == newOrder;
 }
 
-static llvm::MapVector<tt::LoadOp, LoadInfo>
-assignMemoryLayouts(llvm::SmallVector<std::tuple<tt::LoadOp, int, Operation *>>
+static bool hasSharedEncodingHelper(Operation *loadOp) {
+  // If the load is used by a LocalAllocOp, use the same encoding as the allocs.
+  // If the allocs don't all have the same encoding, bail.
+  if (llvm::any_of(loadOp->getUsers(), [&](Operation *user) {
+        return isa<ttg::LocalAllocOp>(user);
+      })) {
+    ttg::SharedEncodingAttr localAllocEnc;
+    for (auto user : loadOp->getUsers()) {
+      auto localAlloc = dyn_cast<ttg::LocalAllocOp>(user);
+      if (!localAlloc)
+        continue;
+      auto enc = mlir::cast<ttg::SharedEncodingAttr>(
+          localAlloc.getType().getEncoding());
+      if (!localAllocEnc) {
+        localAllocEnc = enc;
+      }
+      if (enc != localAllocEnc)
+        return false;
+    }
+    return true;
+  }
+  return true;
+}
+
+// Check to see if loads can be pipelined.
+static llvm::DenseSet<Operation *>
+filterPipelinedLoad(llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
                         &loadOpToIndLevelAndUse,
                     tt::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
-  llvm::MapVector<tt::LoadOp, LoadInfo> loadToInfo;
-
-  for (auto &[loadOp, dist, use] : loadOpToIndLevelAndUse) {
-    assert(!isLoadFromTensorPtr(loadOp) &&
-           "Block ptr should have been lowered before this pass.");
-
-    if (loadToInfo.count(loadOp))
+  llvm::DenseSet<Operation *> loadsToPipeline;
+  for (auto &[op, dist_, use] : loadOpToIndLevelAndUse) {
+    if (loadsToPipeline.count(op))
       // TODO pawel: err, we'd need to verify that the distance is the same
       continue;
 
-    LoadInfo loadInfo;
-    auto ptr = loadOp.getPtr();
-    unsigned vec = axisInfoAnalysis.getPtrContiguity(ptr);
-    if (auto mask = loadOp.getMask())
-      vec = std::min<unsigned>(vec, axisInfoAnalysis.getMaskAlignment(mask));
+    if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
+      assert(!isLoadFromTensorPtr(loadOp) &&
+             "Block ptr should have been lowered before this pass.");
+      auto ptr = loadOp.getPtr();
+      unsigned vec = axisInfoAnalysis.getPtrContiguity(ptr);
+      if (auto mask = loadOp.getMask())
+        vec = std::min<unsigned>(vec, axisInfoAnalysis.getMaskAlignment(mask));
 
-    auto tensorTy = ptr.getType().dyn_cast<RankedTensorType>();
-    if (!tensorTy)
-      continue;
-    auto ty =
-        tensorTy.getElementType().cast<tt::PointerType>().getPointeeType();
-    unsigned width = vec * ty.getIntOrFloatBitWidth();
+      auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+      if (!tensorTy)
+        continue;
+      auto ty =
+          cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();
+      unsigned width = vec * ty.getIntOrFloatBitWidth();
 
-    // We do not pipeline all loads for the following reasons:
-    // 1. On nvidia GPUs, cp.async's cp-size can only be 4, 8, or 16.
-    // 2. It's likely that pipling small loads won't offer much performance
-    //    improvement and may even hurt performance by increasing register
-    //    pressure.
-    LDBG("Load " << *loadOp << " has width " << width);
-    if (width < 32)
-      continue;
+      // We do not pipeline all loads for the following reasons:
+      // 1. On nvidia GPUs, cp.async's cp-size can only be 4, 8, or 16.
+      // 2. It's likely that pipling small loads won't offer much performance
+      //    improvement and may even hurt performance by increasing register
+      //    pressure.
+      LDBG("Load " << *loadOp << " has width " << width);
+      if (width < 32)
+        continue;
+    }
 
-    if (auto dot = dyn_cast<tt::DotOp>(use)) {
-      loadInfo.usedByDot = true;
-      if (loadIsMMAv3(loadOp)) {
-        loadInfo.loadIsMMAV3 = true;
-        loadInfo.sharedEncoding =
-            getSharedEncoding(loadOp, /*loadIsMMAv3=*/true).value_or(nullptr);
-      } else {
-        loadInfo.sharedEncoding =
-            getSharedEncIfAllUsersAreDotEnc(loadOp.getResult())
+    bool hasSharedEncoding = false;
+    if (use->hasTrait<OpTrait::DotLike>()) {
+      if (loadIsMMAv3(op)) {
+        hasSharedEncoding = true;
+      } else if (isa<tt::ExperimentalDescriptorLoadOp>(op)) {
+        hasSharedEncoding = true;
+      } else if (auto dot = dyn_cast<tt::DotOp>(use)) {
+        // FIXME: if we have a better solution in handling incompatible shared
+        // encoding, we can simplify the logic here by checking if all users are
+        // dot encoding. Fow now, getSharedEncIfAllUsersAreDotEnc will be used
+        // during both scheduling and lowering.
+        bool incompatible = false;
+        auto sharedEncoding =
+            getSharedEncIfAllUsersAreDotEnc(op->getResult(0), incompatible)
                 .value_or(nullptr);
-
-        // HACK: Triton LLVM codegen has a bug where local_loads from #shared to
-        // #mma layout can lead to invalid code if the loaded shape is smaller
-        // than the mma tile (e.g. loading a 128x1 tensor for an MMAv2 dot with
-        // tile {16,8} is bad because 1 < 8).  To work around this, don't
-        // pipeline such loads.
-        //
-        // The codegen bug is caught by an assertion, so if you think you've
-        // fixed it, feel free to delete this code and see if the assert still
-        // fails.  :)
-        if (!loadInfo.sharedEncoding) {
-          if (auto dotEnc = dot.getResult()
-                                .getType()
-                                .getEncoding()
-                                .dyn_cast<ttg::NvidiaMmaEncodingAttr>()) {
-            auto loadTy = loadOp.getType().cast<RankedTensorType>();
-            auto mmaInstrShape = dotEnc.getInstrShape();
-            if (loadTy.getRank() < mmaInstrShape.size())
-              continue;
-            bool ok = true;
-            for (int i = 0; i < mmaInstrShape.size(); i++) {
-              if (loadTy.getShape()[loadTy.getRank() - mmaInstrShape.size() +
-                                    i] < mmaInstrShape[i]) {
-                ok = false;
-                break;
-              }
-            }
-            // If this load might trigger the bug, don't do the fallback logic
-            // below, which might allow the load to be pipelined.
-            if (!ok)
-              continue;
-          }
-        }
+        hasSharedEncoding = sharedEncoding != nullptr;
+        // If we can't agree on a shared encoding skip pipelinig the load.
+        if (incompatible)
+          continue;
       }
     } else if (auto loadOp = dyn_cast<tt::LoadOp>(use)) {
       // The use of this loadOp is another loadOp. If the use is not in the
@@ -580,39 +484,159 @@ assignMemoryLayouts(llvm::SmallVector<std::tuple<tt::LoadOp, int, Operation *>>
       // loadOp) has already be processed in a previous loop iteration. This
       // assumption is held by how loadOpsToIndirectionLevelAndUse recursively
       // collects loadOpToIndLevelAndUse using DFS.
-      if (loadToInfo.count(loadOp) == 0) {
+      if (loadsToPipeline.count(loadOp) == 0) {
         continue;
       }
     }
 
     // If we still don't have a shared encoding, try a "generic" shared
     // encoding.
-    if (!loadInfo.sharedEncoding && !isMMAv3Dot(use)) {
-      loadInfo.sharedEncoding =
-          getSharedEncoding(loadOp, /*isMMAV3=*/loadInfo.loadIsMMAV3)
-              .value_or(nullptr);
-      loadInfo.blockedEncoding = getBlockedEncoding(loadOp, axisInfoAnalysis);
-    }
+    if (!hasSharedEncoding && !isa<ttng::WarpGroupDotOp>(use))
+      hasSharedEncoding = hasSharedEncodingHelper(op);
 
     // If that still didn't work, bail on pipelining this load.
-    if (!loadInfo.sharedEncoding) {
+    if (!hasSharedEncoding) {
       continue;
     }
-    loadToInfo[loadOp] = loadInfo;
+    loadsToPipeline.insert(op);
   }
+  return loadsToPipeline;
+}
+
+// When loop doesn't have num_stages attributes, we will look for any load or
+// dot (only the first one in the chain). With the attribute we should look for
+// any op, but also only the first one.
+static llvm::SmallVector<Operation *>
+getTransitiveUserInBlock(Operation *baseOp, scf::ForOp &forOp) {
+  llvm::SmallVector<Operation *> users;
+  DenseSet<Operation *> seen;
+  bool loopHasAttribute = forOp->hasAttr(tt::kNumStagesAttrName);
+  std::function<void(Operation *, Operation *, bool)> dfs =
+      [&](Operation *op, Operation *baseOp, bool anyOp) {
+        if (!seen.insert(op).second)
+          return;
+        if (op != baseOp) {
+          if (anyOp) {
+            // Only track the first op in the dependence chain.
+            users.push_back(op);
+            return;
+          }
+          if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op) ||
+              op->hasTrait<OpTrait::DotLike>()) {
+            // Stop recursion when hitting a LoadOp or a DotOp.
+            users.push_back(op);
+            return;
+          }
+        }
+        for (Operation *user : op->getUsers())
+          if (user->getBlock() == op->getBlock())
+            dfs(user, baseOp, anyOp);
+      };
+  dfs(baseOp, baseOp, false /*anyOp*/);
+  // For now, this needs to be aligned with loadOpsToIndirectionLevelAndUse
+  // since only those uses are in the schedule. Once we move all scheduling to
+  // happen before lowering, any direct use will have a stage assigned.
+  if (loopHasAttribute) {
+    seen.clear();
+    dfs(baseOp, baseOp, true /*anyOp*/);
+  }
+  return users;
+}
+
+static llvm::MapVector<Operation *, LoadInfo>
+assignMemoryLayouts(scf::ForOp &forOp, tt::CoarseSchedule &schedule,
+                    tt::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  llvm::MapVector<Operation *, LoadInfo> loadToInfo;
+
+  // Go through all loads in the loop, check to see if they are pipelined.
+  llvm::DenseSet<Operation *> loadsToPipeline;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (!isa<tt::LoadOp>(op) && !isa<tt::ExperimentalDescriptorLoadOp>(op))
+      continue;
+    if (loadToInfo.count(&op))
+      // TODO pawel: err, we'd need to verify that the distance is the same
+      continue;
+    if (!schedule.count(&op))
+      continue;
+
+    // Check stage for uses. If any use is in a different stage, treat it
+    // as a pipelined load.
+    auto users = getTransitiveUserInBlock(&op, forOp);
+    LLVM_DEBUG({
+      LDBG("TransitiveUser for load " << op);
+      for (const auto user : users) {
+        LDBG("  - use: " << *user);
+      }
+    });
+
+    bool isPipelined = false;
+    auto [sLoad, _cLoad] = schedule[&op];
+    for (auto user : users) {
+      if (!schedule.count(user))
+        continue;
+      auto [stage, _cluster] = schedule[user];
+      if (stage != sLoad) {
+        isPipelined = true;
+        break;
+      }
+    }
+    if (!isPipelined)
+      continue;
+
+    loadsToPipeline.insert(&op);
+    LoadInfo loadInfo;
+    for (auto use : users) {
+      if (use->hasTrait<OpTrait::DotLike>()) {
+        loadInfo.usedByDot = true;
+        if (loadIsMMAv3(&op)) {
+          loadInfo.loadIsMMAV3 = true;
+          loadInfo.sharedEncoding =
+              getSharedEncoding(&op, /*loadIsMMAv3=*/true).value_or(nullptr);
+        } else if (isa<tt::ExperimentalDescriptorLoadOp>(op)) {
+          loadInfo.sharedEncoding =
+              getSharedEncoding(&op, /*loadIsMMAv3=*/true).value_or(nullptr);
+        } else if (auto dot = dyn_cast<tt::DotOp>(use)) {
+          bool incompatible = false;
+          loadInfo.sharedEncoding =
+              getSharedEncIfAllUsersAreDotEnc(op.getResult(0), incompatible)
+                  .value_or(nullptr);
+        }
+      }
+
+      // If we still don't have a shared encoding, try a "generic" shared
+      // encoding.
+      if (!loadInfo.sharedEncoding && !isa<ttng::WarpGroupDotOp>(use)) {
+        loadInfo.sharedEncoding =
+            getSharedEncoding(&op, /*isMMAV3=*/loadInfo.loadIsMMAV3)
+                .value_or(nullptr);
+        if (auto loadOp = dyn_cast<tt::LoadOp>(op))
+          loadInfo.blockedEncoding =
+              getBlockedEncoding(loadOp, axisInfoAnalysis);
+      }
+
+      // If that still didn't work, bail on pipelining this load.
+      if (!loadInfo.sharedEncoding)
+        continue;
+    }
+    loadToInfo[&op] = loadInfo;
+  }
+  // Make sure all loads in loadsToPipeline are in loadToInfo.
+  for (auto *load : loadsToPipeline)
+    assert(loadToInfo.count(load) &&
+           "pipelined loads should have sharedEncoding");
 
   return loadToInfo;
 }
 
-static llvm::MapVector<tt::LoadOp, LoadInfo>
-scheduleLoads(scf::ForOp forOp, CoarseSchedule &schedule,
-              DenseSet<Operation *> &rootUsers, int numStages) {
+static void scheduleLoads(scf::ForOp forOp, tt::CoarseSchedule &schedule,
+                          DenseSet<Operation *> &rootUsers, int numStages) {
+
   ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
   tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
   // Get all loads that are (transitively) used by dot ops and their distance
   // to the dot op.
-  llvm::SmallVector<std::tuple<tt::LoadOp, int, Operation *>>
+  llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
       loadOpToIndLevelAndUse = loadOpsToIndirectionLevelAndUse(forOp);
   LLVM_DEBUG({
     LDBG("Found " << loadOpToIndLevelAndUse.size() << " loads to pipeline:");
@@ -623,29 +647,38 @@ scheduleLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     }
   });
   if (loadOpToIndLevelAndUse.empty())
-    return {};
+    return;
 
-  // Check which loads are good for pipelining, and assign them
-  // memory layouts.
-  llvm::MapVector<tt::LoadOp, LoadInfo> loadToInfo =
-      assignMemoryLayouts(loadOpToIndLevelAndUse, axisInfoAnalysis);
+  // We assume loads with different dist are assigned to different stages.
+  // If numStages is 2, we will have no stage available for indirect loads
+  // with dist >= 1. In general, when dist is equal to numStages - 1, we
+  // should not pipeline it.
+  auto it = llvm::remove_if(loadOpToIndLevelAndUse, [=](auto op) {
+    return std::get<1>(op) >= numStages - 1;
+  });
+  loadOpToIndLevelAndUse.erase(it, loadOpToIndLevelAndUse.end());
 
-  if (loadToInfo.empty())
-    return {};
+  // Check which loads are good for pipelining.
+  llvm::DenseSet<Operation *> loadsToPipeline =
+      filterPipelinedLoad(loadOpToIndLevelAndUse, axisInfoAnalysis);
+  if (loadsToPipeline.empty())
+    return;
 
   // Calculate the stage distance between applicable loads.
   int maxIndirectionLevel = -1;
   for (auto [loadOp, dist, use] : loadOpToIndLevelAndUse) {
-    if (loadToInfo.count(loadOp) == 0)
+    if (loadsToPipeline.count(loadOp) == 0)
       continue;
     maxIndirectionLevel = std::max(maxIndirectionLevel, dist);
   }
   unsigned stagesBetweenLoads =
       ceil<unsigned>(numStages - 2, maxIndirectionLevel + 1);
 
-  CoarseSchedule::Cluster rootUsersCluster = schedule.clusters.newAtFront();
+  tt::CoarseSchedule::Cluster rootUsersCluster = schedule.clusters.newAtFront();
   // Put the root uses of the loads in the last stage.
   for (auto &[loadOp, dist, use] : loadOpToIndLevelAndUse) {
+    if (loadsToPipeline.count(loadOp) == 0)
+      continue;
     // Non-LoadOp(s) are the root uses of all LoadOp(s) and should be
     // always present in the opInfo
     if (!isa<tt::LoadOp>(use)) {
@@ -654,60 +687,55 @@ scheduleLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     }
   }
 
-  SmallVector<CoarseSchedule::Cluster> loadsClusters;
+  SmallVector<tt::CoarseSchedule::Cluster> loadsClusters;
   for (int i = 0; i < maxIndirectionLevel + 1; i++) {
     loadsClusters.push_back(schedule.clusters.newAtBack());
   }
   // Assign stages to the loads.
   for (auto [loadOp, indLevel, _] : loadOpToIndLevelAndUse) {
-    if (loadToInfo.count(loadOp) == 0)
+    if (loadsToPipeline.count(loadOp) == 0)
       continue;
     int stage = (maxIndirectionLevel - indLevel) * stagesBetweenLoads;
     schedule.insert(loadOp, stage, loadsClusters[indLevel]);
   }
-
-  // Distance from the load to the use.
-  for (auto [loadOp, _, use] : loadOpToIndLevelAndUse) {
-    if (loadToInfo.count(loadOp) == 0)
-      continue;
-    loadToInfo[loadOp].distToUse = schedule[use].first - schedule[loadOp].first;
-  }
-
-  return loadToInfo;
 }
 
 // Schedule the prologue and epilogue `if` ops in the loop, pushing them as
 // close to the loop boundaries as possible. Return the cluster after the
 // prologue (or the beginning of the loop if there is no prologue).
-static CoarseSchedule::Cluster
-schedulePrologueAndEpilogue(scf::ForOp forOp, CoarseSchedule &schedule,
+static tt::CoarseSchedule::Cluster
+schedulePrologueAndEpilogue(scf::ForOp forOp, tt::CoarseSchedule &schedule,
                             DenseSet<Operation *> &rootUsers, int numStages) {
-  CoarseSchedule::Cluster afterPrologue = schedule.clusters.begin();
+  tt::CoarseSchedule::Cluster afterPrologue = schedule.clusters.begin();
 
   // Look for the IfOp that is in the backward slice any of the currently
   // scheduled ops and put it at the beginning of the loop.
   DenseMap<scf::IfOp, int> ifsToStage;
-  for (auto [op, stageAndCluster] : schedule.opToStageAndCluster) {
-    SetVector<Operation *> backwardSlice;
-    BackwardSliceOptions opt;
-    opt.omitBlockArguments = true;
-    getBackwardSlice((Operation *)op, &backwardSlice, opt);
+  // Go stage by stage.
+  for (int stage = 0; stage < numStages; stage++) {
+    for (auto [op, stage_, cluster] : schedule.getOpsInOrder(forOp)) {
+      if (stage_ != stage)
+        continue;
+      SetVector<Operation *> backwardSlice;
+      BackwardSliceOptions opt;
+      opt.omitBlockArguments = true;
+      getBackwardSlice((Operation *)op, &backwardSlice, opt);
 
-    int stage = stageAndCluster.first;
-    for (auto op : backwardSlice) {
-      if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        ifsToStage.insert({ifOp, stage});
+      for (auto op : backwardSlice) {
+        if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+          ifsToStage.insert({ifOp, stage});
+        }
       }
     }
   }
-  CoarseSchedule::Cluster prologueCluster = schedule.clusters.newAtFront();
+  tt::CoarseSchedule::Cluster prologueCluster = schedule.clusters.newAtFront();
   for (auto [ifOp, stage] : ifsToStage) {
     schedule.insert(ifOp, stage, prologueCluster);
   }
 
   // Look for the IfOp that is in the forward slice of the root users and put it
   // at the end of the loop.
-  CoarseSchedule::Cluster epilogueCluster = schedule.clusters.newAtBack();
+  tt::CoarseSchedule::Cluster epilogueCluster = schedule.clusters.newAtBack();
   for (auto rootUser : rootUsers) {
     SetVector<Operation *> forwardSlice;
     getForwardSlice(rootUser, &forwardSlice);
@@ -734,9 +762,9 @@ schedulePrologueAndEpilogue(scf::ForOp forOp, CoarseSchedule &schedule,
 
 // Add dependencies of anchor ops to the coarse schedule. Schedule them to
 // the same stage and ordering cluster as the anchor op.
-static void scheduleDependencies(scf::ForOp forOp, CoarseSchedule &schedule,
+static void scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule,
                                  int numStages) {
-  SmallVector<std::tuple<Operation *, int, CoarseSchedule::Cluster>>
+  SmallVector<std::tuple<Operation *, int, tt::CoarseSchedule::Cluster>>
       opsInOrder = schedule.getOpsInOrder(forOp);
   // Schedule dependencies stage by stage.
   for (int stage = 0; stage < numStages; stage++) {
@@ -751,7 +779,7 @@ static void scheduleDependencies(scf::ForOp forOp, CoarseSchedule &schedule,
 // Find dependencies with distance of 1. They will go to the next stage,
 // but in the cluster before the current op.
 static void scheduleDistanceOneDependencies(scf::ForOp forOp,
-                                            CoarseSchedule &schedule,
+                                            tt::CoarseSchedule &schedule,
                                             int numStages) {
   auto getNestedOperands = [](Operation *op) -> SmallVector<Value> {
     SmallVector<Value> operands;
@@ -765,7 +793,8 @@ static void scheduleDistanceOneDependencies(scf::ForOp forOp,
   };
 
   // Mapping from the cluster to the cluster before it.
-  DenseMap<CoarseSchedule::Cluster *, CoarseSchedule::Cluster> dist1Cluster;
+  DenseMap<tt::CoarseSchedule::Cluster *, tt::CoarseSchedule::Cluster>
+      dist1Cluster;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (schedule.count(&op) == 0)
       continue;
@@ -774,7 +803,7 @@ static void scheduleDistanceOneDependencies(scf::ForOp forOp,
     if (stage == numStages - 1)
       continue;
     for (Value operand : getNestedOperands(&op)) {
-      if (auto arg = operand.dyn_cast<BlockArgument>()) {
+      if (auto arg = dyn_cast<BlockArgument>(operand)) {
         if (arg.getArgNumber() > 0 && arg.getOwner() == op.getBlock()) {
           auto yieldOp = op.getBlock()->getTerminator();
           Value v = yieldOp->getOperand(arg.getArgNumber() - 1);
@@ -800,31 +829,214 @@ static void scheduleDistanceOneDependencies(scf::ForOp forOp,
   }
 }
 
+static void
+scheduleRemainingToLastStage(scf::ForOp forOp, tt::CoarseSchedule &schedule,
+                             tt::CoarseSchedule::Cluster afterPrologue,
+                             int numStages) {
+  // Assign the rest of the ops to the last stage.
+  // Take care of the ordering of the ops - uses cannot be scheduled to the
+  // cluster before the definition.
+  DenseMap<Operation *, tt::CoarseSchedule::Cluster> opToCluster;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (schedule.count(&op) == 0) {
+      opToCluster[&op] = afterPrologue;
+    }
+  }
+  SmallVector<Operation *> queue;
+  for (auto [op, stage, cluster] : schedule.getOpsInOrder(forOp)) {
+    // We really only care about the producers from the last stage.
+    // Others will be scheduled before these ops anyway.
+    if (stage == numStages - 1) {
+      queue.push_back(op);
+    }
+  }
+  while (!queue.empty()) {
+    Operation *op = queue.pop_back_val();
+    for (auto user : op->getUsers()) {
+      if (opToCluster.count(user)) {
+        tt::CoarseSchedule::Cluster userCluster = opToCluster[user];
+        tt::CoarseSchedule::Cluster opCluster;
+        if (schedule.count(op))
+          opCluster = schedule[op].second;
+        else
+          opCluster = opToCluster[op];
+        if (*userCluster < *opCluster) {
+          opToCluster[user] = opCluster;
+          queue.push_back(user);
+        }
+      }
+    }
+  }
+  for (auto [op, cluster] : opToCluster) {
+    schedule.insert(op, numStages - 1, cluster);
+  }
+}
+
 // Create an allocation that can hold distance number of loadOp shapes.
-static Value createAlloc(scf::ForOp &forOp, tt::LoadOp loadOp,
+static Value createAlloc(scf::ForOp &forOp, Operation *loadOp,
                          ttg::SharedEncodingAttr sharedEnc, unsigned distance) {
   OpBuilder builder(forOp);
-  auto ty = cast<RankedTensorType>(loadOp.getType());
+  Attribute sharedMemorySpace =
+      triton::gpu::SharedMemorySpaceAttr::get(forOp.getContext());
+  auto ty = cast<RankedTensorType>(loadOp->getResultTypes()[0]);
   SmallVector<int64_t> bufferShape(ty.getShape().begin(), ty.getShape().end());
   bufferShape.insert(bufferShape.begin(), distance);
   Type memdescType = mlir::triton::MemDescType::get(
-      bufferShape, ty.getElementType(), sharedEnc, /*mutableMemory*/ true);
+      bufferShape, ty.getElementType(), sharedEnc, sharedMemorySpace,
+      /*mutableMemory*/ true);
   Value alloc = builder.create<mlir::triton::gpu::LocalAllocOp>(
-      loadOp.getLoc(), memdescType, Value());
+      loadOp->getLoc(), memdescType, Value());
   return alloc;
+}
+
+// Create an allocation to hold the mbarriers.
+static Value createBarrierAlloc(scf::ForOp &forOp, unsigned distance) {
+  OpBuilder builder(forOp);
+  Attribute sharedMemorySpace =
+      triton::gpu::SharedMemorySpaceAttr::get(forOp.getContext());
+  Location loc = forOp.getLoc();
+  auto context = forOp.getContext();
+  auto barrierCTALayout =
+      ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
+                              /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+  auto barrierEncoding =
+      ttg::SharedEncodingAttr::get(context, 1, 1, 1, {0}, barrierCTALayout);
+  Type barrierMemDescType = tt::MemDescType::get(
+      {distance}, builder.getI64Type(), barrierEncoding, sharedMemorySpace,
+      /*mutableMemory=*/true);
+  Type singleBarrierMemDescType =
+      tt::MemDescType::get({1}, builder.getI64Type(), barrierEncoding,
+                           sharedMemorySpace, /*mutableMemory=*/true);
+  Value barrierAlloc = builder.create<mlir::triton::gpu::LocalAllocOp>(
+      loc, barrierMemDescType, Value());
+  for (unsigned i = 0; i < distance; i++) {
+    Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
+    Value barrierView = builder.create<ttg::MemDescSubviewOp>(
+        loc, singleBarrierMemDescType, barrierAlloc, idx);
+    builder.create<ttng::InitBarrierOp>(forOp->getLoc(), barrierView, 1);
+  }
+  return barrierAlloc;
+}
+
+struct AsyncLoad {
+  AsyncLoad(Operation *loadOp, Value alloc) : loadOp(loadOp), alloc(alloc) {}
+  Operation *loadOp;
+  Value alloc;
+  Value barrier;
+  Operation *waitOp = nullptr;
+  bool isTMALoad = false;
+};
+
+// Create barriers and wait ops for the async loads. Barriers may be shared by
+// multiple loads is the schedule allows it.
+static void createTMABarrierAndWait(
+    scf::ForOp &forOp, SmallVector<AsyncLoad> &asyncLoads, Value insertIdx,
+    Value extractIdx, Value phase, int numBuffers, tt::CoarseSchedule &schedule,
+    SmallVector<Value> &barriers,
+    const llvm::MapVector<Operation *, LoadInfo> &loadToInfo) {
+  llvm::SmallDenseMap<Operation *, AsyncLoad *> loadToAsyncLoad;
+  for (AsyncLoad &asyncLoad : asyncLoads) {
+    loadToAsyncLoad[asyncLoad.loadOp] = &asyncLoad;
+  }
+  SmallVector<SmallVector<AsyncLoad *>> loadGroups;
+  llvm::SmallDenseSet<Operation *> visited;
+  // Find groups of loads that can share the same barrier. We look consecutive
+  // loads and check that there are uses in between.
+  for (AsyncLoad &asyncLoad : asyncLoads) {
+    if (!asyncLoad.isTMALoad || visited.count(asyncLoad.loadOp))
+      continue;
+    llvm::SmallDenseSet<Operation *> users;
+    SmallVector<AsyncLoad *> group;
+    Block *loadBlock = asyncLoad.loadOp->getBlock();
+    auto addToGroup = [&](AsyncLoad *loadInfo) {
+      group.push_back(loadInfo);
+      visited.insert(loadInfo->loadOp);
+      for (Operation *user : loadInfo->loadOp->getUsers()) {
+        auto it = loadToInfo.find(loadInfo->loadOp);
+        if (it != loadToInfo.end()) {
+          // Special case for MMAv3 loads, we can ignore the alloc and only
+          // consider uses of the alloc op since it will be removed.
+          if (it->second.loadIsMMAV3) {
+            auto alloc = cast<ttg::LocalAllocOp>(
+                (*loadInfo->loadOp->getUsers().begin()));
+            if (alloc->getBlock() == loadBlock) {
+              users.insert(alloc->getUsers().begin(), alloc->getUsers().end());
+              continue;
+            }
+          }
+        }
+        Operation *userInBlock = loadBlock->findAncestorOpInBlock(*user);
+        if (userInBlock)
+          users.insert(userInBlock);
+      }
+    };
+    addToGroup(&asyncLoad);
+    Operation *nextOp = asyncLoad.loadOp->getNextNode();
+    while (nextOp) {
+      if (users.count(nextOp) || visited.count(nextOp))
+        break;
+      if (isa<tt::ExperimentalDescriptorLoadOp>(nextOp)) {
+        auto it = loadToAsyncLoad.find(nextOp);
+        if (it != loadToAsyncLoad.end() && it->second->isTMALoad) {
+          addToGroup(it->second);
+        }
+      }
+      nextOp = nextOp->getNextNode();
+    }
+    loadGroups.push_back(group);
+  }
+
+  // For each group calculate the size and insert the barrier after the last
+  // load.
+  for (SmallVector<AsyncLoad *> &group : loadGroups) {
+    int sizeInBytes = 0;
+    for (AsyncLoad *asyncLoad : group) {
+      auto tensorTy =
+          cast<RankedTensorType>(asyncLoad->loadOp->getResult(0).getType());
+      int loadSize = product(tensorTy.getShape());
+      sizeInBytes +=
+          loadSize * tensorTy.getElementType().getIntOrFloatBitWidth() / 8;
+    }
+
+    Value barrierAlloc = createBarrierAlloc(forOp, numBuffers);
+    barriers.push_back(barrierAlloc);
+    Location loc = forOp.getLoc();
+    OpBuilder builder(forOp);
+    Attribute sharedMemorySpace =
+        triton::gpu::SharedMemorySpaceAttr::get(builder.getContext());
+    tt::MemDescType barrierTy = tt::MemDescType::get(
+        {1}, builder.getI64Type(),
+        cast<tt::MemDescType>(barrierAlloc.getType()).getEncoding(),
+        sharedMemorySpace,
+        /*mutableMemory=*/true);
+    builder.setInsertionPoint(group[0]->loadOp);
+    Value barrier = builder.create<ttg::MemDescSubviewOp>(
+        loc, barrierTy, barrierAlloc, ArrayRef<Value>({insertIdx}));
+    Value pred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
+    Operation *expect = builder.create<ttng::BarrierExpectOp>(
+        forOp.getLoc(), barrier, sizeInBytes, pred);
+    auto [stage, cluster] = schedule[asyncLoads[0].loadOp];
+    schedule.insert(expect, stage, cluster);
+
+    builder.setInsertionPointAfter(group.back()->loadOp);
+    Value barrierViewWait = builder.create<ttg::MemDescSubviewOp>(
+        loc, barrierTy, barrierAlloc, ArrayRef<Value>({extractIdx}));
+    Operation *wait =
+        builder.create<ttng::WaitBarrierOp>(loc, barrierViewWait, phase);
+    // Update the async loads info.
+    for (AsyncLoad *asyncLoad : group) {
+      asyncLoad->barrier = barrier;
+      asyncLoad->waitOp = wait;
+    }
+  }
 }
 
 // Convert load ops into their asyn version and apply multi-buffering based on
 // the required number of buffers.
 static SmallVector<Value>
-createAsyncOps(scf::ForOp &forOp, CoarseSchedule &schedule,
-               llvm::MapVector<tt::LoadOp, LoadInfo> &loadToInfo,
-               int numStages) {
-  struct AsyncLoad {
-    AsyncLoad(tt::LoadOp loadOp, Value alloc) : loadOp(loadOp), alloc(alloc) {}
-    tt::LoadOp loadOp;
-    Value alloc;
-  };
+createAsyncOps(scf::ForOp &forOp, tt::CoarseSchedule &schedule,
+               llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
+               SmallVector<Value> &barriers, int numStages) {
   // Calculate the number of buffers needed for each load.
   // TODO pawel: we could do more fine-grained allocation here and
   // allocate only the number of buffers that specific loads need.
@@ -844,12 +1056,17 @@ createAsyncOps(scf::ForOp &forOp, CoarseSchedule &schedule,
 
   SmallVector<AsyncLoad> asyncLoads;
   SmallVector<Value> allocs;
+  bool hasTMALoad = false;
   for (auto &[loadOp, info] : loadToInfo) {
     assert(info.sharedEncoding && "LoadOp shared encoding not defined.");
     Value alloc = createAlloc(forOp, loadOp, info.sharedEncoding, numBuffers);
     assert(alloc && "Failed to create alloc for the async load.");
     allocs.push_back(alloc);
     asyncLoads.emplace_back(loadOp, alloc);
+    if (isa<tt::ExperimentalDescriptorLoadOp>(loadOp)) {
+      hasTMALoad = true;
+      asyncLoads.back().isTMALoad = true;
+    }
   }
 
   IRRewriter builder(forOp.getContext());
@@ -862,12 +1079,16 @@ createAsyncOps(scf::ForOp &forOp, CoarseSchedule &schedule,
   Value one = builder.create<arith::ConstantIntOp>(loc, 1, 32);
   Value insertIdx = minusOne;
   Value extractIdx = minusOne;
+  Value phase = Value();
   Value numBuffersVal =
       builder.create<arith::ConstantIntOp>(loc, numBuffers, 32);
   SmallVector<Value> newOperands;
   newOperands.push_back(insertIdx);
   newOperands.push_back(extractIdx);
-  Value phase;
+  if (hasTMALoad) {
+    phase = builder.create<arith::ConstantIntOp>(loc, 0, 32);
+    newOperands.push_back(phase);
+  }
   unsigned newOperandIndex = forOp.getBody()->getNumArguments();
   // Patch the loop to add the new loop carried dependencies.
   scf::ForOp newForOp =
@@ -876,6 +1097,9 @@ createAsyncOps(scf::ForOp &forOp, CoarseSchedule &schedule,
   forOp = newForOp;
   insertIdx = newForOp.getBody()->getArgument(newOperandIndex);
   extractIdx = newForOp.getBody()->getArgument(newOperandIndex + 1);
+  if (phase) {
+    phase = newForOp.getBody()->getArgument(newOperandIndex + 2);
+  }
 
   // Create two counters for the insert and extract indices to avoid creating
   // long liverange.
@@ -889,21 +1113,55 @@ createAsyncOps(scf::ForOp &forOp, CoarseSchedule &schedule,
   Value cndExt = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
                                                extractIdx, numBuffersVal);
   extractIdx = builder.create<arith::SelectOp>(loc, cndExt, extractIdx, zero);
+  if (phase) {
+    Value nextPhase = builder.create<arith::XOrIOp>(loc, phase, one);
+    phase = builder.create<arith::SelectOp>(loc, cndExt, phase, nextPhase);
+  }
+  createTMABarrierAndWait(forOp, asyncLoads, insertIdx, extractIdx, phase,
+                          numBuffers, schedule, barriers, loadToInfo);
 
   // Create a cluster for the prefetches. It may end up being empty, but this
   // is OK.
-  CoarseSchedule::Cluster prefetchCluster = schedule.clusters.newAtBack();
+  tt::CoarseSchedule::Cluster prefetchCluster = schedule.clusters.newAtBack();
 
   for (AsyncLoad &asyncLoad : asyncLoads) {
-    createAsyncCopy(forOp, asyncLoad.loadOp, asyncLoad.alloc, insertIdx,
-                    extractIdx, schedule, prefetchCluster, loadToInfo,
-                    numStages);
+    if (auto loadOp = dyn_cast<tt::LoadOp>(asyncLoad.loadOp)) {
+      createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
+                      schedule, prefetchCluster, loadToInfo, numStages);
+    } else {
+      auto descLoad = cast<tt::ExperimentalDescriptorLoadOp>(asyncLoad.loadOp);
+      createTMAAsyncCopy(forOp, descLoad, asyncLoad.alloc, insertIdx,
+                         extractIdx, asyncLoad.barrier, asyncLoad.waitOp, phase,
+                         schedule, loadToInfo, numStages);
+    }
   }
   SmallVector<Value> newYieldOperands = {insertIdx, extractIdx};
+  if (phase)
+    newYieldOperands.push_back(phase);
   // Patch the yield with the updated counters.
-  appendToYield(forOp, newYieldOperands);
+  appendToForOpYield(forOp, newYieldOperands);
 
   return allocs;
+}
+
+static void invalidateBarriers(OpBuilder &builder,
+                               SmallVector<Value> &barriers) {
+  Attribute sharedMemorySpace =
+      triton::gpu::SharedMemorySpaceAttr::get(builder.getContext());
+  for (Value barrier : barriers) {
+    int numBarriers = cast<tt::MemDescType>(barrier.getType()).getShape()[0];
+    for (int i = 0; i < numBarriers; i++) {
+      Value idx = builder.create<arith::ConstantIntOp>(barrier.getLoc(), i, 32);
+      tt::MemDescType barrierTy = tt::MemDescType::get(
+          {1}, builder.getI64Type(),
+          cast<tt::MemDescType>(barrier.getType()).getEncoding(),
+          sharedMemorySpace,
+          /*mutableMemory=*/true);
+      Value barrierView = builder.create<ttg::MemDescSubviewOp>(
+          barrier.getLoc(), barrierTy, barrier, idx);
+      builder.create<ttng::InvalBarrierOp>(barrier.getLoc(), barrierView);
+    }
+  }
 }
 
 bool mlir::triton::preProcessLoopAndGetSchedule(
@@ -911,20 +1169,46 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
   // Schedule the loads and root ops (dot ops) in the loop. This will give us
   // a scaffold for the final schedule.
   DenseSet<Operation *> rootUsers;
-  CoarseSchedule coarseSchedule(numStages);
-  llvm::MapVector<tt::LoadOp, LoadInfo> loadToInfo =
-      scheduleLoads(forOp, coarseSchedule, rootUsers, numStages);
-  if (loadToInfo.empty())
+  tt::CoarseSchedule coarseSchedule(numStages);
+
+  scheduleLoads(forOp, coarseSchedule, rootUsers, numStages);
+  if (coarseSchedule.empty())
     return false;
 
-  // Convert the loads into async loads and create the allocs.
-  SmallVector<Value> allocs =
-      createAsyncOps(forOp, coarseSchedule, loadToInfo, numStages);
+  LLVM_DEBUG({
+    LDBG("Coarse schedule loads only:");
+    coarseSchedule.dump();
+  });
 
-  CoarseSchedule::Cluster afterPrologue =
+  tt::CoarseSchedule::Cluster afterPrologue =
       schedulePrologueAndEpilogue(forOp, coarseSchedule, rootUsers, numStages);
   LLVM_DEBUG({
     LDBG("Coarse schedule with prologue and epilogue:");
+    coarseSchedule.dump();
+  });
+
+  ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
+  tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
+  llvm::MapVector<Operation *, LoadInfo> loadToInfo =
+      assignMemoryLayouts(forOp, coarseSchedule, axisInfoAnalysis);
+  if (loadToInfo.empty())
+    return false;
+  for (auto &[loadOp, info] : loadToInfo) {
+    for (auto *use : getTransitiveUserInBlock(loadOp, forOp)) {
+      if (!coarseSchedule.count(use))
+        continue;
+      loadToInfo[loadOp].distToUse =
+          coarseSchedule[use].first - coarseSchedule[loadOp].first;
+    }
+  }
+
+  SmallVector<Value> barriers;
+  // Convert the loads into async loads and create the allocs.
+  SmallVector<Value> allocs =
+      createAsyncOps(forOp, coarseSchedule, loadToInfo, barriers, numStages);
+
+  LLVM_DEBUG({
+    LDBG("Coarse schedule with async loads:");
     coarseSchedule.dump();
   });
 
@@ -940,10 +1224,7 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
     coarseSchedule.dump();
   });
 
-  // Assign the rest of the ops to the last stage, main cluster of the loop
-  for (auto &op : forOp.getBody()->without_terminator()) {
-    coarseSchedule.insertIfAbsent(&op, numStages - 1, afterPrologue);
-  }
+  scheduleRemainingToLastStage(forOp, coarseSchedule, afterPrologue, numStages);
   LLVM_DEBUG({
     LDBG("Final coarse schedule:");
     coarseSchedule.dump();
@@ -970,6 +1251,8 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
   OpBuilder builder(forOp);
   builder.setInsertionPointAfter(forOp);
   builder.create<ttg::AsyncWaitOp>(forOp.getLoc(), ValueRange({}), 0);
+  // Invalidate any mbarrier create
+  invalidateBarriers(builder, barriers);
   // Explicitly deallocate allocated tensors after the wait op
   for (auto alloc : allocs)
     builder.create<ttg::LocalDeallocOp>(forOp.getLoc(), alloc);
@@ -1003,7 +1286,7 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
       minCommitNumber = std::min(minCommitNumber, thisHistorySum);
       return minCommitNumber;
     }
-    if (auto arg = val.dyn_cast<BlockArgument>()) {
+    if (auto arg = mlir::dyn_cast<BlockArgument>(val)) {
       Block *block = arg.getOwner();
       auto forOp = dyn_cast<scf::ForOp>(block->getParentOp());
 
@@ -1107,16 +1390,17 @@ void mlir::triton::updateWaits(ModuleOp module) {
 // also adds some MemDesc's to the wait.  The idea is that if you have
 //
 //   %alloc = ttg.local_alloc ...
-//   %a = ttng.dot_async %alloc
-//   %a1 = ttng.dot_wait %a
+//   %a = ttng.warp_group_dot %alloc
+//   %a1 = ttng.warp_group_dot_wait %a
 //
 // then we want the wait to depend on %alloc as well as %a.  This extends the
 // live range of %alloc, so that it won't be destroyed until after the dot is
 // waited on.
 //
-// Specifically, this function finds all dot_async ops that elements of `values`
-// depend on.  Then it adds the MemDesc operands of those dots to the wait.
-static void threadValuesThroughWait(ttng::DotWaitOp wait,
+// Specifically, this function finds all warp_group_dot ops that elements of
+// `values` depend on.  Then it adds the MemDesc operands of those dots to the
+// wait.
+static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
                                     MutableArrayRef<Value> values) {
   IRRewriter builder(wait.getContext());
   builder.setInsertionPoint(wait);
@@ -1133,12 +1417,12 @@ static void threadValuesThroughWait(ttng::DotWaitOp wait,
   newOperands.insert(values.begin(), values.end());
 
   // Find memdefs depended on by `values` through async dot ops.
-  SmallVector<ttng::DotAsyncOp> asyncDots;
+  SmallVector<ttng::WarpGroupDotOp> asyncDots;
   for (Value v : values) {
     BackwardSliceOptions options;
     options.omitBlockArguments = true;
     options.filter = [&](Operation *op) {
-      if (auto dot = dyn_cast<ttng::DotAsyncOp>(op)) {
+      if (auto dot = dyn_cast<ttng::WarpGroupDotOp>(op)) {
         asyncDots.push_back(dot);
         return false;
       }
@@ -1148,7 +1432,7 @@ static void threadValuesThroughWait(ttng::DotWaitOp wait,
     getBackwardSlice(v, &slice, options);
   }
 
-  for (ttng::DotAsyncOp dot : asyncDots) {
+  for (ttng::WarpGroupDotOp dot : asyncDots) {
     for (Value operand : dot.getOperands()) {
       if (isa<tt::MemDescType>(operand.getType())) {
         newOperands.insert(operand);
@@ -1158,7 +1442,7 @@ static void threadValuesThroughWait(ttng::DotWaitOp wait,
 
   // We can't use replaceWithNewOp because we're changing the number of return
   // values in the operation.
-  auto newWait = builder.create<ttng::DotWaitOp>(
+  auto newWait = builder.create<ttng::WarpGroupDotWaitOp>(
       wait.getLoc(), llvm::to_vector(newOperands), wait.getPendings());
 
   auto dominatedByNewWait = [&](OpOperand &operand) {
@@ -1179,13 +1463,14 @@ static void threadValuesThroughWait(ttng::DotWaitOp wait,
   wait->erase();
 }
 
-// Determines whether a given MMAv3 dot op, represented as ttng.dot_async, needs
-// a wait immediately after it.
+// Determines whether a given MMAv3 dot op, represented as ttng.warp_group_dot,
+// needs a wait immediately after it.
 //
 // In PTX, MMAv3 exists only as an asynchronous op.  In Triton, we can represent
-// MMAv3 ops as either tt.dot (synchronous) or ttng.dot_async.  But even if we
-// use ttng.dot_async, the conservative thing is to make a dot "effectively
-// synchronous" by inserting a `ttng.dot_wait {pendings=0}` right after it.
+// MMAv3 ops as either ttng.warp_group_dot {isAsync=True} or ttng.warp_group_dot
+// {isAsync=False}.  But even if we use ttng.warp_group_dot {isAsync=True}, the
+// conservative thing is to make a dot "effectively synchronous" by inserting a
+// `ttng.warp_group_dot_wait {pendings=0}` right after it.
 //
 // We can omit the wait and create a "properly async" dot if all of the
 // following are true.
@@ -1197,28 +1482,29 @@ static void threadValuesThroughWait(ttng::DotWaitOp wait,
 //     and will be synced with a `wait 0` at the beginning of the `if` block.
 //
 //  3. During iteration i, between the start of the loop up until the first
-//     `ttng.dot_wait {pendings=0}` op, the result of the dot from iteration i-1
-//     is consumed only by other MMAv3 dots as the `c` operand.
+//     `ttng.warp_group_dot_wait {pendings=0}` op, the result of the dot from
+//     iteration i-1 is consumed only by other MMAv3 dots as the `c` operand.
 //
 //     This is safe because the following pseudo-PTX is valid:
 //
-//        %accum = dot_async %a1, %b1, %c1
-//        %accum = dot_async %a2, %b2, %accum
+//        %accum = warp_group_dot %a1, %b1, %c1
+//        %accum = warp_group_dot %a2, %b2, %accum
 //
 //     That is, the second async dot can use the result of the first one without
 //     an intervening wait.  However, the only operation that can legally read
-//     %accum before the wait is another dot_async, and this only works for the
-//     `c` operand, not `a` or `b`.  See
+//     %accum before the wait is another warp_group_dot, and this only works for
+//     the `c` operand, not `a` or `b`.  See
 //     https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-instructions-wgmma-fence
-//     (ttng::DotAsyncOp corresponds to wgmma.fence followed by one or more
-//     wgmma.async ops, so our understanding is that the two ttng::DotAsyncOps
-//     don't have to correspond to wgmma.async ops with the same shapes as
-//     specified in the docs, because there's an intervening fence.)
+//     (ttng::WarpGroupDotOp corresponds to wgmma.fence followed by one or more
+//     wgmma.async ops, so our understanding is that the two
+//     ttng::WarpGroupDotOps don't have to correspond to wgmma.async ops with
+//     the same shapes as specified in the docs, because there's an intervening
+//     fence.)
 //
 // If the op can be properly async, this function returns the index of the dot
 // in the loop's iter_args.  (Rule (2) above ensures this is well-defined.)
 //
-static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
+static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
                                                 scf::ForOp forOp) {
   LDBG("Considering whether to make MMAv3 dot properly async: " << dotOp);
 
@@ -1234,11 +1520,19 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
     // allowed in between.
     Value transitiveOperand = operand;
     while (isa_and_nonnull<ttg::ConvertLayoutOp, tt::TransOp>(
-        transitiveOperand.getDefiningOp())) {
-      transitiveOperand = transitiveOperand.getDefiningOp()->getOperand(0);
+               transitiveOperand.getDefiningOp()) ||
+           isa<BlockArgument>(transitiveOperand)) {
+      auto blockArg = dyn_cast<BlockArgument>(transitiveOperand);
+      if (blockArg && blockArg.getOwner() == forOp.getBody()) {
+        transitiveOperand =
+            cast<scf::YieldOp>(blockArg.getOwner()->getTerminator())
+                .getOperand(blockArg.getArgNumber() - 1);
+      } else if (Operation *def = transitiveOperand.getDefiningOp()) {
+        transitiveOperand = def->getOperand(0);
+      }
     }
     return forOp.isDefinedOutsideOfLoop(transitiveOperand) ||
-           isa<ttg::MemDescSubviewOp>(transitiveOperand.getDefiningOp());
+           transitiveOperand.getDefiningOp<ttg::MemDescSubviewOp>();
   };
 
   // We don't have to call checkOperand on getC() because it's always in
@@ -1264,12 +1558,16 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
         if (iterArg) {
           // The dot is used by the loop's yield, but we can't have any other
           // uses.
+          LDBG("Can't make dot async because dot is used by multiple ops in "
+               "the loop.");
           return std::nullopt;
         }
         iterArgIdx = argIdx;
         iterArg = forOp.getRegionIterArg(argIdx);
         continue;
       }
+      LDBG("Can't make dot async because dot is unconditionally used in the "
+           "loop.");
       return std::nullopt;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(user->getParentOp())) {
@@ -1288,16 +1586,17 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
   // Rule 3a: Are the only users of the dot's result from iteration i-1 other
   // MMAv3 dots?  If so, we're done, this dot can be properly async.
   if (llvm::all_of(iterArg.getUses(), [&](OpOperand &use) {
-        return isa<ttng::DotAsyncOp>(use.getOwner()) &&
+        return isa<ttng::WarpGroupDotOp>(use.getOwner()) &&
                use.getOperandNumber() == 2;
       })) {
     return iterArgIdx;
   }
 
   // Rule 3b: Are all users of the dot's result from iteration i-1 after the
-  // first `dot_wait {pendings=0}` op?  If so, the dot can be properly async,
-  // but we have to thread its result from iteration i-1 through the wait.
-  auto waitOps = forOp.getBody()->getOps<ttng::DotWaitOp>();
+  // first `warp_group_dot_wait {pendings=0}` op?  If so, the dot can be
+  // properly async, but we have to thread its result from iteration i-1 through
+  // the wait.
+  auto waitOps = forOp.getBody()->getOps<ttng::WarpGroupDotWaitOp>();
   auto firstWaitOpIter = llvm::find_if(
       waitOps, [&](auto waitOp) { return waitOp.getPendings() == 0; });
   if (firstWaitOpIter != waitOps.end() &&
@@ -1308,7 +1607,8 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
         }
         return (*firstWaitOpIter)->isBeforeInBlock(user);
       })) {
-    LDBG("MMAv3 dot can be properly async because it follows a dot_wait "
+    LDBG("MMAv3 dot can be properly async because it follows a "
+         "warp_group_dot_wait "
          "{pendings=0}.\n"
          << "  wait: " << *firstWaitOpIter << "\n"
          << "  dot: " << dotOp);
@@ -1323,16 +1623,16 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
 
 // If necessary, insert a dot-wait inside the loop, waiting for the results of
 // the properly-async dots from iteration i-1 to complete.  (We pipeline to
-// depth 2, so there are at most 2 copies of each dot_async in flight at a
+// depth 2, so there are at most 2 copies of each warp_group_dot in flight at a
 // time.)
 //
-// We can skip inserting the wait if we have a `dot_wait {pendings=0}` somewhere
-// in the loop.  To see why, consider:
+// We can skip inserting the wait if we have a `warp_group_dot_wait
+// {pendings=0}` somewhere in the loop.  To see why, consider:
 //
-//   dot_async
-//   dot_async; wait 0  // synchronous dot
-//   dot_async
-//   dot_async
+//   warp_group_dot
+//   warp_group_dot; wait 0  // synchronous dot
+//   warp_group_dot
+//   warp_group_dot
 //
 // In this example, there are three properly-async dots, so we'd normally put
 // `wait 3` at the end of the loop, meaning "wait until there are 3 or fewer
@@ -1340,13 +1640,13 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
 // completes, there are only *two* pending async dots from this iteration, so
 // this wait would do nothing.  This is true in general, no matter where the
 // `wait 0` appears.
-static void insertAsyncDotWaitInLoop(
+static void insertAsyncWarpGroupDotWaitInLoop(
     scf::ForOp forOp,
     const llvm::MapVector<Operation *, int /*iterArgIdx*/> &properlyAsyncDots) {
   if (properlyAsyncDots.empty())
     return;
 
-  if (llvm::any_of(forOp.getBody()->getOps<ttng::DotWaitOp>(),
+  if (llvm::any_of(forOp.getBody()->getOps<ttng::WarpGroupDotWaitOp>(),
                    [](auto wait) { return wait.getPendings() == 0; })) {
     return;
   }
@@ -1370,8 +1670,8 @@ static void insertAsyncDotWaitInLoop(
 
     for (auto [block, users] : blockToUsers) {
       OpBuilder builder(block, block->begin());
-      auto newWait = builder.create<ttng::DotWaitOp>(asyncDot->getLoc(),
-                                                     ArrayRef<Value>{}, 0);
+      auto newWait = builder.create<ttng::WarpGroupDotWaitOp>(
+          asyncDot->getLoc(), ArrayRef<Value>{}, 0);
 
       threadValuesThroughWait(newWait, users);
     }
@@ -1388,9 +1688,9 @@ static void insertAsyncDotWaitInLoop(
   IRRewriter builder(forOp.getContext());
   auto lastAsyncDot = properlyAsyncDots.back().first;
   builder.setInsertionPointAfter(lastAsyncDot);
-  auto wait = builder.create<ttng::DotWaitOp>(lastAsyncDot->getLoc(),
-                                              /*inputs=*/ArrayRef<Value>{},
-                                              properlyAsyncDots.size());
+  auto wait = builder.create<ttng::WarpGroupDotWaitOp>(
+      lastAsyncDot->getLoc(),
+      /*inputs=*/ArrayRef<Value>{}, properlyAsyncDots.size());
 
   // Thread the results of the async dots through the wait.
   SmallVector<Value> addlWaitOperands;
@@ -1400,49 +1700,40 @@ static void insertAsyncDotWaitInLoop(
   threadValuesThroughWait(wait, addlWaitOperands);
 }
 
-// Convert MMAv3 tt::DotOps (i.e. Hopper wgmma) into ttng::DotAsyncOps and
-// insert ttng::DotWaitOps as necessary.
+// Convert MMAv3 ttng::WarpGroupDotOps {isAsync = False} (i.e. Hopper wgmma)
+// into ttng::WarpGroupDotOps {isAsync = True} and insert
+// ttng::WarpGroupDotWaitOps as necessary.
 //
 // We assume we have space for each dot to be pipelined to depth 2, i.e. each
-// dot op in the loop can have at most 2 dot_async ops in flight at once.  (Each
-// dot_async op usually corresponds to a series of wgmma.async ops.)
+// dot op in the loop can have at most 2 warp_group_dot ops in flight at once.
+// (Each warp_group_dot op usually corresponds to a series of wgmma.async ops.)
 void triton::asyncLaunchDots(scf::ForOp forOp) {
   LDBG("Original loop:\n" << *forOp);
 
-  // First, change every MMAv3 tt.dot into ttng.dot_async.  The rest of this
-  // function is concerned with inserting ttng.dot_wait ops in the appropriate
-  // places.
-  //
-  // It's not strictly necessary to convert every dot into dot_async:
-  // Synchronous MMAv3 dots can be represented equally well as `tt.dot` or
-  // `ttng.dot_async; wait 0`.  But this makes things easier elsewhere.
+  // First, change every MMAv3 ttng.warp_group_dot {isAsync=false}
+  // into ttng.warp_group_dot {isAsync=true}.
+  // The rest of this function is concerned with inserting
+  // ttng.warp_group_dot_wait ops in the appropriate places.
   //
   // We call those dots that don't need to be followed immediately by a `wait 0`
   // "properly async", or sometimes just "async".
-  IRRewriter builder(forOp.getContext());
-  for (auto dotOp : llvm::to_vector(forOp.getBody()->getOps<tt::DotOp>())) {
-    if (isMMAv3Dot(dotOp)) {
-      builder.setInsertionPoint(dotOp);
-      builder.replaceOpWithNewOp<ttng::DotAsyncOp>(
-          dotOp, dotOp.getA(), dotOp.getB(), dotOp.getC(),
-          dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc());
-    }
-  }
-
+  //
   // For each dot, determine whether it can be properly async, or if it needs a
   // sync immediately after.  If it can be properly async, we know its only use
   // is in the loop's `yield` statement; asyncDots maps the op to its index in
   // the yield op.
+  IRRewriter builder(forOp.getContext());
   llvm::MapVector<Operation *, int /*iterArgIdx*/> properlyAsyncDots;
-  for (auto dotOp : forOp.getBody()->getOps<ttng::DotAsyncOp>()) {
-    if (auto iterArgIdx = dotCanBeProperlyAsync(dotOp, forOp)) {
-      properlyAsyncDots[dotOp] = *iterArgIdx;
+  for (auto WarpGroupDotOp : forOp.getBody()->getOps<ttng::WarpGroupDotOp>()) {
+    WarpGroupDotOp.setIsAsync(true);
+    if (auto iterArgIdx = dotCanBeProperlyAsync(WarpGroupDotOp, forOp)) {
+      properlyAsyncDots[WarpGroupDotOp] = *iterArgIdx;
     } else {
-      builder.setInsertionPointAfter(dotOp);
-      auto wait =
-          builder.create<ttng::DotWaitOp>(dotOp.getLoc(), ArrayRef<Value>{},
-                                          /*pendings=*/0);
-      SmallVector<Value> waitOperands = {dotOp.getResult()};
+      builder.setInsertionPointAfter(WarpGroupDotOp);
+      auto wait = builder.create<ttng::WarpGroupDotWaitOp>(
+          WarpGroupDotOp.getLoc(), ArrayRef<Value>{},
+          /*pendings=*/0);
+      SmallVector<Value> waitOperands = {WarpGroupDotOp.getResult()};
       threadValuesThroughWait(wait, waitOperands);
     }
   }
@@ -1456,7 +1747,7 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
   // iteration's set of asynchronous dots (and their corresponding async copies
   // from global to shmem) can't start until the first iteration's set has
   // completed.
-  insertAsyncDotWaitInLoop(forOp, properlyAsyncDots);
+  insertAsyncWarpGroupDotWaitInLoop(forOp, properlyAsyncDots);
 
   // Finally, insert a wait after the loop, waiting for dots from the final
   // iteration of the loop.
@@ -1466,7 +1757,7 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
   }
   // Wait until there are 0 outstanding async dot ops.
   builder.setInsertionPointAfter(forOp);
-  auto dotWaitAfterLoop =
-      builder.create<ttng::DotWaitOp>(forOp.getLoc(), ArrayRef<Value>{}, 0);
-  threadValuesThroughWait(dotWaitAfterLoop, waitOperands);
+  auto WarpGroupDotWaitAfterLoop = builder.create<ttng::WarpGroupDotWaitOp>(
+      forOp.getLoc(), ArrayRef<Value>{}, 0);
+  threadValuesThroughWait(WarpGroupDotWaitAfterLoop, waitOperands);
 }

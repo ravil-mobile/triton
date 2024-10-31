@@ -10,7 +10,6 @@ using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::getSizePerThread;
 using ::mlir::triton::gpu::getTotalElemsPerThread;
-using ::mlir::triton::gpu::isaDistributedLayout;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 
 // Compute the offset of the matrix to load.
@@ -26,11 +25,10 @@ computeOffsets(Value threadId, bool isARow, bool isBRow, ArrayRef<int> fpw,
                ConversionPatternRewriter &rewriter, Location loc,
                Type resultTy) {
   auto *ctx = rewriter.getContext();
-  auto wpt = cast<RankedTensorType>(resultTy)
-                 .getEncoding()
-                 .cast<DotOperandEncodingAttr>()
-                 .getParent()
-                 .cast<NvidiaMmaEncodingAttr>()
+  auto wpt = cast<NvidiaMmaEncodingAttr>(
+                 cast<DotOperandEncodingAttr>(
+                     cast<RankedTensorType>(resultTy).getEncoding())
+                     .getParent())
                  .getWarpsPerCTA();
 
   Value _1 = i32_val(1);
@@ -92,16 +90,15 @@ static Value loadA(Value tensor, const SharedMemoryObject &smemObj,
                    const LLVMTypeConverter *typeConverter,
                    ConversionPatternRewriter &rewriter, Type resultTy) {
   static constexpr std::array<int, 3> fpw{{2, 2, 1}};
-  auto mmaEncoding = cast<RankedTensorType>(resultTy)
-                         .getEncoding()
-                         .cast<DotOperandEncodingAttr>()
-                         .getParent()
-                         .cast<NvidiaMmaEncodingAttr>();
+  auto mmaEncoding = cast<NvidiaMmaEncodingAttr>(
+      cast<DotOperandEncodingAttr>(
+          cast<RankedTensorType>(resultTy).getEncoding())
+          .getParent());
   auto wpt = mmaEncoding.getWarpsPerCTA();
 
   auto *ctx = rewriter.getContext();
   auto tensorTy = cast<MemDescType>(tensor.getType());
-  auto sharedLayout = tensorTy.getEncoding().cast<SharedEncodingAttr>();
+  auto sharedLayout = cast<SharedEncodingAttr>(tensorTy.getEncoding());
   auto shape = tensorTy.getShape();
   auto order = sharedLayout.getOrder();
 
@@ -109,9 +106,8 @@ static Value loadA(Value tensor, const SharedMemoryObject &smemObj,
   Value smemBase = smemObj.getBaseBeforeSlice(order[0], loc, rewriter);
 
   bool isARow = order[0] != 0;
-  auto resultEncoding = cast<RankedTensorType>(resultTy)
-                            .getEncoding()
-                            .cast<DotOperandEncodingAttr>();
+  auto resultEncoding = cast<DotOperandEncodingAttr>(
+      cast<RankedTensorType>(resultTy).getEncoding());
   auto [offsetAM, offsetAK, _3, _4] = computeOffsets(
       thread, isARow, false, fpw,
       mmaEncoding.getMMAv1ShapePerWarp(resultEncoding.getOpIdx()),
@@ -153,8 +149,8 @@ static Value loadA(Value tensor, const SharedMemoryObject &smemObj,
   Type elemX2Ty = vec_ty(f16_ty, 2);
   Type elemTy = f16_ty;
   if (tensorTy.getElementType().isBF16()) {
-    elemX2Ty = vec_ty(i16_ty, 2);
-    elemTy = i16_ty;
+    elemX2Ty = vec_ty(bf16_ty, 2);
+    elemTy = bf16_ty;
   }
 
   // prepare arguments
@@ -219,18 +215,17 @@ static Value loadB(Value tensor, const SharedMemoryObject &smemObj,
                    const LLVMTypeConverter *typeConverter,
                    ConversionPatternRewriter &rewriter, Type resultTy) {
   static constexpr std::array<int, 3> fpw{{2, 2, 1}};
-  auto mmaEncoding = cast<RankedTensorType>(resultTy)
-                         .getEncoding()
-                         .cast<DotOperandEncodingAttr>()
-                         .getParent()
-                         .cast<NvidiaMmaEncodingAttr>();
+  auto mmaEncoding = cast<NvidiaMmaEncodingAttr>(
+      cast<DotOperandEncodingAttr>(
+          cast<RankedTensorType>(resultTy).getEncoding())
+          .getParent());
   auto wpt = mmaEncoding.getWarpsPerCTA();
   // smem
   auto strides = smemObj.strides;
 
   auto *ctx = rewriter.getContext();
   auto tensorTy = cast<MemDescType>(tensor.getType());
-  auto sharedLayout = tensorTy.getEncoding().cast<SharedEncodingAttr>();
+  auto sharedLayout = cast<SharedEncodingAttr>(tensorTy.getEncoding());
 
   auto shape = tensorTy.getShape();
   auto order = sharedLayout.getOrder();
@@ -238,9 +233,8 @@ static Value loadB(Value tensor, const SharedMemoryObject &smemObj,
   Value smem = smemObj.getBaseBeforeSlice(order[0], loc, rewriter);
   bool isBRow = order[0] != 0; // is row-major in shared memory layout
   // isBRow_ indicates whether B is row-major in DotOperand layout
-  auto resultEncoding = cast<RankedTensorType>(resultTy)
-                            .getEncoding()
-                            .cast<DotOperandEncodingAttr>();
+  auto resultEncoding = cast<DotOperandEncodingAttr>(
+      cast<RankedTensorType>(resultTy).getEncoding());
 
   int vecB = sharedLayout.getVec();
   Value strideBN = isBRow ? i32_val(1) : strides[1];
@@ -281,8 +275,8 @@ static Value loadB(Value tensor, const SharedMemoryObject &smemObj,
   Type elemTy = f16_ty;
   Type elemX2Ty = vec_ty(f16_ty, 2);
   if (tensorTy.getElementType().isBF16()) {
-    elemTy = i16_ty;
-    elemX2Ty = vec_ty(i16_ty, 2);
+    elemTy = bf16_ty;
+    elemX2Ty = vec_ty(bf16_ty, 2);
   }
 
   SmallVector<Value> ptrB(numPtrB);

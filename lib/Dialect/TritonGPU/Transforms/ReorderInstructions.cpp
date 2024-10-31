@@ -9,6 +9,7 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
@@ -18,10 +19,13 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#define GEN_PASS_CLASSES
-#include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
-using namespace mlir;
+namespace mlir {
+namespace triton {
+namespace gpu {
+
+#define GEN_PASS_DEF_TRITONGPUREORDERINSTRUCTIONS
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
 static bool willIncreaseRegisterPressure(Operation *op) {
   if (isa<triton::gpu::LocalLoadOp>(op))
@@ -29,13 +33,14 @@ static bool willIncreaseRegisterPressure(Operation *op) {
   auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op);
   if (!cvt)
     return false;
-  if (cvt.getType().getEncoding().isa<triton::gpu::DotOperandEncodingAttr>())
+  if (mlir::isa<triton::gpu::DotOperandEncodingAttr>(
+          cvt.getType().getEncoding()))
     return true;
   return false;
 }
 
 class TritonGPUReorderInstructionsPass
-    : public TritonGPUReorderInstructionsBase<
+    : public impl::TritonGPUReorderInstructionsBase<
           TritonGPUReorderInstructionsPass> {
 public:
   TritonGPUReorderInstructionsPass() = default;
@@ -104,9 +109,8 @@ public:
     // Move `dot` operand so that conversions to opIdx=1 happens after
     // conversions to opIdx=0
     m.walk([&](triton::gpu::LocalLoadOp op) {
-      auto dstEncoding = op.getType()
-                             .getEncoding()
-                             .dyn_cast<triton::gpu::DotOperandEncodingAttr>();
+      auto dstEncoding = mlir::dyn_cast<triton::gpu::DotOperandEncodingAttr>(
+          op.getType().getEncoding());
       if (!dstEncoding)
         return;
       int opIdx = dstEncoding.getOpIdx();
@@ -131,6 +135,6 @@ public:
   }
 };
 
-std::unique_ptr<Pass> mlir::triton::gpu::createReorderInstructionsPass() {
-  return std::make_unique<TritonGPUReorderInstructionsPass>();
-}
+} // namespace gpu
+} // namespace triton
+} // namespace mlir

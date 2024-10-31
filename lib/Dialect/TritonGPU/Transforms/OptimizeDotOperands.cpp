@@ -9,11 +9,11 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include <memory>
 
-namespace {
+namespace mlir {
+namespace triton {
+namespace gpu {
 
-using namespace mlir;
-using namespace triton;
-using namespace triton::gpu;
+namespace {
 
 // Given
 //   convert(trans(src)) #dot_operand ->
@@ -38,7 +38,7 @@ public:
     }
     auto sharedLoadTy = cast<RankedTensorType>(cvtOp.getType());
     auto cvtEncoding =
-        sharedLoadTy.getEncoding().dyn_cast<DotOperandEncodingAttr>();
+        dyn_cast<DotOperandEncodingAttr>(sharedLoadTy.getEncoding());
     if (!cvtEncoding)
       return failure();
 
@@ -59,12 +59,12 @@ public:
                                 srcTy.getElementType(), /*needTrans=*/true);
     if (newInnerCvtEnc == cvtEncoding)
       return failure();
-
     rewriter.setInsertionPoint(trans);
+    auto sharedMemorySpace = SharedMemorySpaceAttr::get(getContext());
     auto alloc = rewriter.create<LocalAllocOp>(
         trans.getLoc(),
         MemDescType::get(srcTy.getShape(), srcTy.getElementType(),
-                         newInnerCvtEnc),
+                         newInnerCvtEnc, sharedMemorySpace),
         trans.getSrc());
     auto newTrans = rewriter.create<TransOp>(trans.getLoc(), alloc,
                                              ArrayRef<int32_t>({1, 0}));
@@ -111,7 +111,7 @@ public:
                                 PatternRewriter &rewriter) const override {
     // Only consider conversions to dot operand.
     auto cvtTy = cast<RankedTensorType>(cvt.getType());
-    if (!cvtTy.getEncoding().isa<DotOperandEncodingAttr>())
+    if (!isa<DotOperandEncodingAttr>(cvtTy.getEncoding()))
       return failure();
 
     auto src = cvt.getSrc().getDefiningOp();
@@ -210,16 +210,10 @@ public:
   LogicalResult matchAndRewrite(LocalAllocOp allocOp,
                                 PatternRewriter &rewriter) const override {
     if (!allocOp->hasOneUse() ||
-        !isa<DotOp, nvidia_gpu::DotAsyncOp>(*allocOp->getUsers().begin()))
+        !allocOp->getUsers().begin()->hasTrait<OpTrait::DotLike>())
       return failure();
 
     auto dot = *allocOp->getUsers().begin();
-    auto dotEnc = cast<RankedTensorType>(dot->getResult(0).getType())
-                      .getEncoding()
-                      .dyn_cast<NvidiaMmaEncodingAttr>();
-    if (!dotEnc || dotEnc.getVersionMajor() != 3)
-      return failure();
-
     if (!allocOp.getSrc())
       return failure();
 
@@ -229,7 +223,7 @@ public:
       return failure();
 
     MemDescType allocType = allocOp.getType();
-    auto allocEncoding = allocType.getEncoding().cast<SharedEncodingAttr>();
+    auto allocEncoding = cast<SharedEncodingAttr>(allocType.getEncoding());
     TensorOrMemDesc srcTy = trans.getSrc().getType();
 
     // MMAv3 with transpose only supports f16 and bf16.  Fall back to MMAv3
@@ -255,7 +249,8 @@ public:
         allocEncoding.getCTALayout(), srcTy.getElementType());
 
     MemDescType innerTy =
-        MemDescType::get(srcTy.getShape(), srcTy.getElementType(), newInnerEnc);
+        MemDescType::get(srcTy.getShape(), srcTy.getElementType(), newInnerEnc,
+                         allocType.getMemorySpace());
     auto newAlloc = rewriter.create<LocalAllocOp>(allocOp.getLoc(), innerTy,
                                                   trans.getSrc());
     rewriter.replaceOpWithNewOp<TransOp>(allocOp, newAlloc,
@@ -268,10 +263,11 @@ public:
 //   dot(convert(lhs #mma) #shared, rhs) #mma ->
 //   dot(convert(lhs #mma) #dot_operand, rhs) #mma,
 // for fp16 or bf16 MMAv3 dots.
-struct MMAV3UseRegOperand : public OpRewritePattern<DotOp> {
+struct MMAV3UseRegOperand
+    : public OpRewritePattern<triton::nvidia_gpu::WarpGroupDotOp> {
   using OpRewritePattern::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(DotOp dotOp,
+  LogicalResult matchAndRewrite(triton::nvidia_gpu::WarpGroupDotOp dotOp,
                                 PatternRewriter &rewriter) const override {
     auto alloc = dotOp.getOperand(0).getDefiningOp<LocalAllocOp>();
     if (!alloc || !alloc.getSrc())
@@ -281,20 +277,21 @@ struct MMAV3UseRegOperand : public OpRewritePattern<DotOp> {
       return cast<TensorOrMemDesc>(v.getType()).getEncoding();
     };
 
-    if (!getEncoding(dotOp.getOperand(0)).isa<SharedEncodingAttr>())
+    if (!isa<SharedEncodingAttr>(getEncoding(dotOp.getOperand(0))))
       return failure();
-    auto srcEnc = getEncoding(alloc.getSrc()).dyn_cast<NvidiaMmaEncodingAttr>();
+    auto srcEnc = dyn_cast<NvidiaMmaEncodingAttr>(getEncoding(alloc.getSrc()));
     auto dstEnc =
-        getEncoding(dotOp.getResult()).dyn_cast<NvidiaMmaEncodingAttr>();
+        dyn_cast<NvidiaMmaEncodingAttr>(getEncoding(dotOp.getResult()));
     if (!srcEnc || srcEnc.getVersionMajor() != 3 || !dstEnc ||
         dstEnc.getVersionMajor() != 3)
       return failure();
     auto srcTy = cast<RankedTensorType>(alloc.getSrc().getType());
+    auto kWidth = 32 / srcTy.getElementTypeBitWidth();
     auto dotOperandEnc = DotOperandEncodingAttr::get(
-        dotOp.getContext(), /*opIdx=*/0, srcEnc, /*kWidth=*/0);
+        dotOp.getContext(), /*opIdx=*/0, srcEnc, /*kWidth=*/kWidth);
     auto newTy = RankedTensorType::get(srcTy.getShape(), srcTy.getElementType(),
                                        dotOperandEnc);
-    if (!isMmaToDotShortcut(srcTy, newTy))
+    if (!matchMmaV3AndDotOperandLayout(srcTy, newTy))
       return failure();
 
     Value newOperand =
@@ -306,18 +303,15 @@ struct MMAV3UseRegOperand : public OpRewritePattern<DotOp> {
 
 } // namespace
 
-// TODO(jlebar): These autogenerated headers (and the passes they declare)
-// should be included within a namespace, but we have to do it consistently.
-#define GEN_PASS_CLASSES
+#define GEN_PASS_DEF_TRITONGPUOPTIMIZEDOTOPERANDS
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
 class TritonGPUOptimizeDotOperandsPass
-    : public TritonGPUOptimizeDotOperandsBase<
+    : public impl::TritonGPUOptimizeDotOperandsBase<
           TritonGPUOptimizeDotOperandsPass> {
 public:
-  explicit TritonGPUOptimizeDotOperandsPass(bool hoistLayoutConversion) {
-    this->hoistLayoutConversion = hoistLayoutConversion;
-  }
+  using impl::TritonGPUOptimizeDotOperandsBase<
+      TritonGPUOptimizeDotOperandsPass>::TritonGPUOptimizeDotOperandsBase;
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -339,8 +333,6 @@ public:
   }
 };
 
-std::unique_ptr<Pass>
-mlir::triton::gpu::createOptimizeDotOperandsPass(bool hoistLayoutConversion) {
-  return std::make_unique<TritonGPUOptimizeDotOperandsPass>(
-      hoistLayoutConversion);
-}
+} // namespace gpu
+} // namespace triton
+} // namespace mlir

@@ -172,8 +172,8 @@ private:
 
   void setToEntryState(dataflow::Lattice<AxisInfo> *lattice) override {
     propagateIfChanged(
-        lattice,
-        lattice->join(AxisInfo::getPessimisticValueState(lattice->getPoint())));
+        lattice, lattice->join(
+                     AxisInfo::getPessimisticValueState(lattice->getAnchor())));
   }
 
   void visitNonControlFlowArguments(
@@ -195,9 +195,10 @@ public:
       dataflow::Lattice<AxisInfo>>::getLatticeElement;
   using FuncAxisInfoMapT = DenseMap<FunctionOpInterface, AxisInfo>;
 
-  void visitOperation(Operation *op,
-                      ArrayRef<const dataflow::Lattice<AxisInfo> *> operands,
-                      ArrayRef<dataflow::Lattice<AxisInfo> *> results) override;
+  LogicalResult
+  visitOperation(Operation *op,
+                 ArrayRef<const dataflow::Lattice<AxisInfo> *> operands,
+                 ArrayRef<dataflow::Lattice<AxisInfo> *> results) override;
   void
   visitForOpInductionVar(scf::ForOp op,
                          ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices);
@@ -239,8 +240,8 @@ public:
   AxisInfo
   getAxisInfo(OpTy op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
-    auto intAttr = op.getValue().template dyn_cast<IntegerAttr>();
-    auto boolAttr = op.getValue().template dyn_cast<BoolAttr>();
+    auto intAttr = dyn_cast<IntegerAttr>(op.getValue());
+    auto boolAttr = dyn_cast<BoolAttr>(op.getValue());
     if (intAttr || boolAttr) {
       int64_t value{};
       if (intAttr)
@@ -253,7 +254,7 @@ public:
                       /*knownConstantValue=*/{value});
     }
     // TODO: generalize to dense attr
-    auto splatAttr = op.getValue().template dyn_cast<SplatElementsAttr>();
+    auto splatAttr = dyn_cast<SplatElementsAttr>(op.getValue());
     if (splatAttr && splatAttr.getElementType().isIntOrIndex()) {
       int64_t value = splatAttr.template getSplatValue<APInt>().getZExtValue();
       TensorType ty = cast<TensorType>(splatAttr.getType());
@@ -277,6 +278,11 @@ public:
 private:
   int64_t getContiguity(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                         int dim) override {
+    // Contiguity assumes an increasing sequence. So for SubIOp contiguous
+    // RHS doesn't produce a contiguous result.
+    if (isa<arith::SubIOp>(op))
+      return gcd(lhs.getContiguity(dim), rhs.getConstancy(dim));
+
     return std::max(gcd(lhs.getConstancy(dim), rhs.getContiguity(dim)),
                     gcd(lhs.getContiguity(dim), rhs.getConstancy(dim)));
   }
@@ -285,8 +291,7 @@ private:
                           int dim) override {
     // lhs = k * d_lhs = k * k' * gcd(d_lhs, d_rhs)
     // rhs = p * d_rhs = p * p' * gcd(d_lhs, d_rhs)
-    // lhs + rhs = k * d_lhs + p * d_rhs = (k * d_lhs + p * d_rhs) *
-    // gcd(d_lhs, d_rhs)
+    // lhs + rhs = k * d_lhs + p * d_rhs = (k * k' + p * p') * gcd(d_lhs, d_rhs)
     auto rhsDivisibility = rhs.getDivisibility(dim);
     if constexpr (std::is_same_v<OpTy, triton::AddPtrOp>) {
       //  %ptr = addptr %lhs, %rhs
@@ -883,16 +888,14 @@ private:
 
   int64_t getDivisibility(arith::ShLIOp op, const AxisInfo &lhs,
                           const AxisInfo &rhs, int dim) override {
-    auto shift = rhs.getConstantValue().has_value()
-                     ? rhs.getConstantValue().value()
-                     : rhs.getDivisibility(dim);
+    auto shift = rhs.getConstantValue().value_or(0);
     auto lhsDivisibility = lhs.getDivisibility(dim);
     if (lhs.getContiguity(dim) > 1 && shift) {
       // Treat [2^n,2^n+1,...]'s divisibility as 1 instead of 2^n
       lhsDivisibility = 1;
     }
     auto numBits = log2Int(lhsDivisibility);
-    return multiplyDivisor(lhsDivisibility, 1 << shift);
+    return multiplyDivisor(lhsDivisibility, 1ll << shift);
   }
 
   int64_t getConstancy(arith::ShLIOp op, const AxisInfo &lhs,
@@ -926,9 +929,9 @@ private:
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    auto shift = rhs.getConstantValue().has_value()
-                     ? rhs.getConstantValue().value()
-                     : rhs.getDivisibility(dim);
+    if (!rhs.getConstantValue().has_value())
+      return 1;
+    auto shift = rhs.getConstantValue().value();
     auto lhsDivisibility = lhs.getDivisibility(dim);
     if (lhs.getContiguity(dim) > 1 && shift) {
       // Treat [2^n,2^n+1,...]'s divisibility as 1 instead of 2^n
@@ -1042,7 +1045,7 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
   visitors.append<LoadOpAxisInfoVisitor>();
 }
 
-void AxisInfoAnalysis::visitOperation(
+LogicalResult AxisInfoAnalysis::visitOperation(
     Operation *op, ArrayRef<const dataflow::Lattice<AxisInfo> *> operands,
     ArrayRef<dataflow::Lattice<AxisInfo> *> results) {
   // TODO: For sure not the right way to do this
@@ -1051,22 +1054,24 @@ void AxisInfoAnalysis::visitOperation(
     if (op->getValue().getRank() == 0)
       setToEntryState((dataflow::Lattice<AxisInfo> *)op);
   AxisInfo curr = visitors.apply(op, operands);
-  if (curr.getRank() == 0)
-    return setAllToEntryStates(results);
+  if (curr.getRank() == 0) {
+    setAllToEntryStates(results);
+    return success();
+  }
   // override with hint
   auto newContiguity = curr.getContiguity();
   auto newDivisibility = curr.getDivisibility();
   auto newConstancy = curr.getConstancy();
   if (Attribute attr = op->getDiscardableAttr("tt.contiguity")) {
-    auto vals = attr.cast<DenseElementsAttr>().getValues<int>();
+    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
     newContiguity = AxisInfo::DimVectorT(vals.begin(), vals.end());
   }
   if (Attribute attr = op->getDiscardableAttr("tt.divisibility")) {
-    auto vals = attr.cast<DenseElementsAttr>().getValues<int>();
+    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
     newDivisibility = AxisInfo::DimVectorT(vals.begin(), vals.end());
   }
   if (Attribute attr = op->getDiscardableAttr("tt.constancy")) {
-    auto vals = attr.cast<DenseElementsAttr>().getValues<int>();
+    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
     newConstancy = AxisInfo::DimVectorT(vals.begin(), vals.end());
   }
   curr = AxisInfo(newContiguity, newDivisibility, newConstancy,
@@ -1074,12 +1079,14 @@ void AxisInfoAnalysis::visitOperation(
   // join all lattice elements
   for (auto *result : results)
     propagateIfChanged(result, result->join(curr));
+  return success();
 }
 
 void AxisInfoAnalysis::visitForOpInductionVar(
     scf::ForOp op, ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices) {
-  auto lb = getLatticeElementFor(op, op.getLowerBound())->getValue();
-  auto step = getLatticeElementFor(op, op.getStep())->getValue();
+  ProgramPoint programPoint(op);
+  auto lb = getLatticeElementFor(&programPoint, op.getLowerBound())->getValue();
+  auto step = getLatticeElementFor(&programPoint, op.getStep())->getValue();
 
   AxisInfo::DimVectorT knownContiguity(1, 1);
   AxisInfo::DimVectorT knownDivisibility(1, 1);
@@ -1105,9 +1112,9 @@ void AxisInfo::initPessimisticStateFromFunc(int argNumber, T funcOp,
   // initialize attributes one by one
   for (auto [vec, attrName] : retVecs) {
     Attribute attr = funcOp.getArgAttr(argNumber, attrName);
-    if (auto int_attr = attr.dyn_cast_or_null<IntegerAttr>())
+    if (auto int_attr = dyn_cast_or_null<IntegerAttr>(attr))
       *vec = DimVectorT(contiguity->size(), int_attr.getValue().getZExtValue());
-    if (auto dense_attr = attr.dyn_cast_or_null<DenseElementsAttr>()) {
+    if (auto dense_attr = dyn_cast_or_null<DenseElementsAttr>(attr)) {
       auto vals = dense_attr.getValues<int>();
       *vec = DimVectorT(vals.begin(), vals.end());
     }
@@ -1126,7 +1133,7 @@ void AxisInfo::initPessimisticStateFromFunc(int argNumber, T funcOp,
   DimVectorT knownDivisibility(rank, 1);
   DimVectorT knownConstancy(rank, 1);
 
-  BlockArgument blockArg = value.dyn_cast<BlockArgument>();
+  BlockArgument blockArg = dyn_cast<BlockArgument>(value);
 
   if (blockArg && blockArg.getOwner()->isEntryBlock()) {
     Operation *op = blockArg.getOwner()->getParentOp();
@@ -1140,6 +1147,14 @@ void AxisInfo::initPessimisticStateFromFunc(int argNumber, T funcOp,
       initPessimisticStateFromFunc(blockArg.getArgNumber(), fun,
                                    &knownContiguity, &knownDivisibility,
                                    &knownConstancy);
+    else if (isa<RegionBranchOpInterface>(op)) {
+      // scf::ForOp, scf::IfOp, scf::WhileOp
+      // Control flow operations are initialized with "unknown" state:
+      // the maximum possible divisibility, contiguity, and constancy.
+      knownDivisibility = DimVectorT(rank, highestPowOf2Divisor<int64_t>(0));
+      knownConstancy = DimVectorT(rank, highestPowOf2Divisor<int64_t>(0));
+      knownContiguity = DimVectorT(rank, highestPowOf2Divisor<int64_t>(0));
+    }
   } else if (Operation *op = value.getDefiningOp()) {
     if (isa<RegionBranchOpInterface>(op)) {
       // scf::ForOp, scf::IfOp, scf::WhileOp
@@ -1152,15 +1167,15 @@ void AxisInfo::initPessimisticStateFromFunc(int argNumber, T funcOp,
     // Other operations are conservatively initialized with the lowest possible
     // divisibility, contiguity, and constancy unless they have specified.
     if (Attribute attr = op->getDiscardableAttr("tt.divisibility")) {
-      auto vals = attr.cast<DenseElementsAttr>().getValues<int>();
+      auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
       knownDivisibility = DimVectorT(vals.begin(), vals.end());
     }
     if (Attribute attr = op->getDiscardableAttr("tt.contiguity")) {
-      auto vals = attr.cast<DenseElementsAttr>().getValues<int>();
+      auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
       knownContiguity = DimVectorT(vals.begin(), vals.end());
     }
     if (Attribute attr = op->getDiscardableAttr("tt.constancy")) {
-      auto vals = attr.cast<DenseElementsAttr>().getValues<int>();
+      auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
       knownConstancy = DimVectorT(vals.begin(), vals.end());
     }
   }

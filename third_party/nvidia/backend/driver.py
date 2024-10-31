@@ -1,5 +1,6 @@
 import functools
 import os
+import sysconfig
 import hashlib
 import subprocess
 import tempfile
@@ -24,11 +25,11 @@ def libcuda_dirs():
     libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode()
     # each line looks like the following:
     # libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
-    locs = [line.split()[-1] for line in libs.splitlines() if "libcuda.so" in line]
+    locs = [line.split()[-1] for line in libs.splitlines() if "libcuda.so.1" in line]
     dirs = [os.path.dirname(loc) for loc in locs]
     env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
     if env_ld_library_path and not dirs:
-        dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so"))]
+        dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so.1"))]
     msg = 'libcuda.so cannot found!\n'
     if locs:
         msg += 'Possible files are located at %s.' % str(locs)
@@ -36,7 +37,7 @@ def libcuda_dirs():
     else:
         msg += 'Please make sure GPU is set up and then run "/sbin/ldconfig"'
         msg += ' (requires sudo) to refresh the linker cache.'
-    assert any(os.path.exists(os.path.join(path, 'libcuda.so')) for path in dirs), msg
+    assert any(os.path.exists(os.path.join(path, 'libcuda.so.1')) for path in dirs), msg
     return dirs
 
 
@@ -48,7 +49,8 @@ def library_dirs():
 def compile_module_from_src(src, name):
     key = hashlib.sha256(src.encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
-    cache_path = cache.get_file(f"{name}.so")
+    ext = sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1]
+    cache_path = cache.get_file(f"{name}.{ext}")
     if cache_path is None:
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "main.c")
@@ -56,7 +58,7 @@ def compile_module_from_src(src, name):
                 f.write(src)
             so = _build(name, src_path, tmpdir, library_dirs(), include_dir, libraries)
             with open(so, "rb") as f:
-                cache_path = cache.put(f.read(), f"{name}.so", binary=True)
+                cache_path = cache.put(f.read(), f"{name}.{ext}", binary=True)
     import importlib.util
     spec = importlib.util.spec_from_file_location(name, cache_path)
     mod = importlib.util.module_from_spec(spec)
@@ -110,6 +112,7 @@ def ty_to_cpp(ty):
         "fp32": "float",
         "f32": "float",
         "fp64": "double",
+        "nvTmaDesc": "CUtensorMap",
     }[ty]
 
 
@@ -121,6 +124,9 @@ def make_launcher(constants, signature, ids):
     def _extracted_type(ty):
         if ty[0] == '*':
             return "PyObject*"
+        if ty == "nvTmaDesc":
+            return "PyObject*"
+
         return ty_to_cpp(ty)
 
     def format_of(ty):
@@ -142,6 +148,16 @@ def make_launcher(constants, signature, ids):
     args_format = ''.join([format_of(_extracted_type(ty)) for ty in signature.values()])
     format = "iiiKKOOOO" + args_format
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
+
+    internal_args_list = []
+    for i, ty in signature.items():
+        if ty[0] == "*":
+            internal_args_list.append(f"ptr_info{i}.dev_ptr")
+        elif ty == "nvTmaDesc":
+            # Note: we have to dereference the pointer
+            internal_args_list.append(f"*tma_ptr{i}")
+        else:
+            internal_args_list.append(f"_arg{i}")
 
     # generate glue code
     params = [i for i in signature.keys() if i not in constants]
@@ -174,9 +190,9 @@ typedef CUresult (*cuLaunchKernelEx_t)(const CUlaunchConfig* config, CUfunction 
 
 static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   // Open the shared library
-  void* handle = dlopen("libcuda.so", RTLD_LAZY);
+  void* handle = dlopen("libcuda.so.1", RTLD_LAZY);
   if (!handle) {{
-    PyErr_SetString(PyExc_RuntimeError, "Failed to open libcuda.so");
+    PyErr_SetString(PyExc_RuntimeError, "Failed to open libcuda.so.1");
     return NULL;
   }}
   // Clear any existing error
@@ -185,7 +201,7 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   // Check for errors
   const char *dlsym_error = dlerror();
   if (dlsym_error) {{
-    PyErr_SetString(PyExc_RuntimeError, "Failed to retrieve cuLaunchKernelEx from libcuda.so");
+    PyErr_SetString(PyExc_RuntimeError, "Failed to retrieve cuLaunchKernelEx from libcuda.so.1");
     return NULL;
   }}
   return cuLaunchKernelExHandle;
@@ -271,6 +287,52 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
   return ptr_info;
 }}
 
+static inline CUtensorMap* getTmaDesc(PyObject *obj) {{
+  if (sizeof(CUtensorMap*) != 8) {{
+    PyErr_SetString(PyExc_SystemError, "getTmaDesc() requires 64-bit compilation");
+    return NULL;
+  }}
+
+  PyObject *method_handle = PyObject_GetAttrString(obj, "tma_desc_cpu_ptr");
+  if (!method_handle) {{
+    PyErr_SetString(PyExc_TypeError, "tma_desc_cpu_ptr() method does not exist");
+    return NULL;
+  }}
+
+  PyObject *empty_tuple = PyTuple_New(0);
+  if (!empty_tuple) {{
+    Py_DECREF(method_handle);
+    PyErr_SetString(PyExc_SystemError, "Internal Python error!");
+    return NULL;
+  }}
+  PyObject *method_ret = PyObject_Call(method_handle, empty_tuple, NULL);
+  Py_DECREF(empty_tuple);
+  Py_DECREF(method_handle);
+  if (!method_ret) {{
+    PyErr_SetString(PyExc_SystemError, "Internal Python error!");
+    return NULL;
+  }}
+
+  if (!PyLong_Check(method_ret)) {{
+    PyErr_SetString(PyExc_TypeError, "tma_desc_cpu_ptr() must return 64-bit int");
+    Py_DECREF(method_ret);
+    return NULL;
+  }}
+
+  uint64_t ptr_as_uint = PyLong_AsUnsignedLongLong(method_ret);
+  Py_DECREF(method_ret);
+  if (!ptr_as_uint) {{
+    PyErr_SetString(PyExc_ValueError, "received NULL ptr from tma_desc_cpu_ptr()");
+    return NULL;
+  }}
+  if (ptr_as_uint % 64 != 0) {{
+    PyErr_SetString(PyExc_ValueError, "tma_desc_cpu_ptr() must be 64-byte aligned");
+    return NULL;
+  }}
+
+  return (CUtensorMap*)(ptr_as_uint);
+}}
+
 static PyObject* launch(PyObject* self, PyObject* args) {{
   int gridX, gridY, gridZ;
   uint64_t _stream;
@@ -302,9 +364,10 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   }}
 
   // raise exception asap
-  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"".join([f"CUtensorMap* tma_ptr{i} = getTmaDesc(_arg{i}); if (!tma_ptr{i}) return NULL;" if ty == "nvTmaDesc" else "" for i, ty in signature.items()])};
   Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function{', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items()) if len(signature) > 0 else ''});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;
@@ -379,7 +442,24 @@ class CudaDriver(GPUDriver):
         warp_size = 32
         return GPUTarget("cuda", capability, warp_size)
 
+    def get_device_interface(self):
+        import torch
+        return torch.cuda
+
     @staticmethod
     def is_active():
         import torch
         return torch.cuda.is_available() and (torch.version.hip is None)
+
+    def get_benchmarker(self):
+        from triton.testing import do_bench
+        return do_bench
+
+    def get_empty_cache_for_benchmark(self):
+        import torch
+
+        # We maintain a buffer of 256 MB that we clear
+        # before each kernel call to make sure that the L2 cache
+        # doesn't contain any input data before the run
+        cache_size = 256 * 1024 * 1024
+        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')

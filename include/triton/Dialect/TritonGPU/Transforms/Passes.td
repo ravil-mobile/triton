@@ -1,8 +1,6 @@
 #ifndef TRITONGPU_PASSES
 #define TRITONGPU_PASSES
 
-// TODO(jlebar): These and our other passes should be in a namespace.
-
 include "mlir/Pass/PassBase.td"
 
 def TritonGPUPipeline : Pass<"tritongpu-pipeline", "mlir::ModuleOp"> {
@@ -13,8 +11,6 @@ def TritonGPUPipeline : Pass<"tritongpu-pipeline", "mlir::ModuleOp"> {
     This may convert some load into asynchronous loads, and multi-buffer the data.
   }];
 
-  let constructor = "mlir::triton::gpu::createPipelinePass()";
-
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
                            "mlir::scf::SCFDialect",
@@ -23,16 +19,7 @@ def TritonGPUPipeline : Pass<"tritongpu-pipeline", "mlir::ModuleOp"> {
   let options = [
     Option<"numStages", "num-stages",
            "int32_t", /*default*/"3",
-           "number of pipeline stages">,
-    Option<"numWarps", "num-warps",
-           "int32_t", /*default*/"4",
-           "number of warps per block">,
-    Option<"numCTAs", "num-ctas",
-           "int32_t", /*default*/"1",
-           "number of CTAs per CGA">,
-    Option<"computeCapability", "compute-capability",
-           "int32_t", /*default*/"80",
-           "device compute capability">
+           "number of pipeline stages">
   ];
 }
 
@@ -44,8 +31,6 @@ def TritonGPUF32DotTC : Pass<"tritongpu-F32DotTC", "mlir::ModuleOp"> {
     to allow using TensorCores. See https://github.com/NVIDIA/cutlass/discussions/385
   }];
 
-  let constructor = "mlir::triton::gpu::createF32DotTCPass()";
-
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
@@ -54,11 +39,20 @@ def TritonGPUPrefetch : Pass<"tritongpu-prefetch", "mlir::ModuleOp"> {
   let summary = "prefetch";
 
   let description = [{
+    This pass attempts to prefetch from shared memory the operands (A and B)
+    of a `tt.dot`, when this operation is located in a loop.
     Decompose `DotOp` instructions in loops into several finer-grained `DotOp`
-    that may have their operands constructed at the end of the previous iteration
+    that may have their operands constructed at the end of the previous
+    iteration.
+    Transformations are performed in five different places:
+      1. The pass emits a prologue to the loop where the data for the first
+         loop iteration are prefetched.
+      2. The loop arguments are extended with the new prefetched values.
+      3. The dotOp parameters is updated with the new args.
+      4. The prefetch operations for the next iteration are added to the loop.
+      5. The yieldOp is updated by adding the prefetched values for the next
+         iteration.
   }];
-
-  let constructor = "mlir::triton::gpu::createPrefetchPass()";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::scf::SCFDialect",
@@ -73,17 +67,9 @@ def TritonGPUAccelerateMatmul : Pass<"tritongpu-accelerate-matmul", "mlir::Modul
     (e.g., Nvidia tensor cores)
   }];
 
-  let constructor = "mlir::triton::gpu::createAccelerateMatmulPass()";
-
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
                            "mlir::triton::TritonDialect"];
-
-  let options = [
-    Option<"computeCapability", "compute-capability",
-           "int32_t", /*default*/"80",
-           "device compute capability">
-  ];
 }
 
 def TritonGPUOptimizeDotOperands : Pass<"tritongpu-optimize-dot-operands", "mlir::ModuleOp"> {
@@ -93,8 +79,6 @@ def TritonGPUOptimizeDotOperands : Pass<"tritongpu-optimize-dot-operands", "mlir
     Re-arranged layouts of tensors used as matrix multiplication operands so as to promote the use of
     hardware-accelerated transpositions.
   }];
-
-  let constructor = "mlir::triton::gpu::createOptimizeDotOperandsPass(/*hostLayoutConversion=*/true)";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
@@ -111,10 +95,12 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
   let summary = "coalesce";
 
   let description = [{
-    TODO
+    The pass analyses loads/stores with type `tensor<tt.ptr<>>` or
+    `tt.ptr<tensor<>>` and replaces the layouts of these operations with
+    coalesced layouts, i.e. cache friendly access patterns.
+    Layout conversions are inserted before and after the load/store op
+    to maintain consistency with the rest of the program.
   }];
-
-  let constructor = "mlir::triton::gpu::createCoalescePass()";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
@@ -124,9 +110,12 @@ def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions
   let summary = "remove superfluous layout conversions";
 
   let description = [{
+    The purpose of this pass is to rewrite the `ConvertLayoutOps` to reduce
+    the number of operations and to prefer favorable layouts like
+    `BlockedEncodingAttr` layout for "expensive" loads and stores
+    (good for coalescing) and `NvidiaMmaEncodingAttr` otherwise
+    (good for tensor ops).
   }];
-
-  let constructor = "mlir::triton::gpu::createRemoveLayoutConversionsPass()";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];
@@ -137,10 +126,12 @@ def TritonGPUOptimizeThreadLocality : Pass<"tritongpu-optimize-thread-locality",
   let summary = "Reduce the cost of synchronization between threads in an SM";
 
   let description = [{
-    Today, this optimizes reduction yielded by loop to be thread-local until after the loop completes.
+    The aim of this pass is to reduce cross-thread communication for reduction
+    operations, by adjusting the reduction size (or layout) to avoid splitting
+    the reduction operation between multiple threads. Currently, this pass only
+    optimizes reduction yielded by loop to be thread-local until
+    after the loop completes.
   }];
-
-  let constructor = "mlir::triton::gpu::createOptimizeThreadLocalityPass()";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];
@@ -153,8 +144,6 @@ def TritonGPUReorderInstructions: Pass<"tritongpu-reorder-instructions", "mlir::
                     "conversions from shared memory before their first use) and (2) promote LLVM instruction "
                     "order more friendly to `ptxas`.";
 
-  let constructor = "mlir::triton::gpu::createReorderInstructionsPass()";
-
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];
 }
@@ -165,7 +154,26 @@ def TritonGPUReduceDataDuplication: Pass<"tritongpu-reduce-data-duplication", "m
 
   let description = "Decomposing conversions this way makes it possible to use CSE and reuse #shared tensors";
 
-  let constructor = "mlir::triton::gpu::createReduceDataDuplicationPass()";
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
+def TritonGPUCombineTensorSelectAndIf: Pass<"tritongpu-combine-tensor-select-and-if", "mlir::ModuleOp"> {
+  let summary = "Combine tensor select and if";
+
+  let description = "For select instruction that uses the same condidtion as the if instruction in the same block "
+                    "this pass combines the select into the if instruction, making the select operands returned by the "
+                    "then/else yields.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
+def TritonGPUOptimizeAccumulatorInit: Pass<"tritongpu-optimize-accumulator-init", "mlir::ModuleOp"> {
+  let summary = "Replace accumulater zero-initialization with the flag indicating first use of the accumulator";
+
+  let description = "For the dot operations that support accumulator-use flag this pass replaces the zero-initialization "
+                    "of the accumulator with the flag indicating the first use of the accumulator.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];

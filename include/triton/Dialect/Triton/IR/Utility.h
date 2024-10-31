@@ -4,7 +4,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include <algorithm>
 #include <numeric>
-#include <string>
 
 namespace mlir {
 
@@ -32,7 +31,11 @@ template <typename Int> Int ceil(Int m, Int n) { return (m + n - 1) / n; }
 
 /// Get the highest power of 2 divisor of an integer.
 template <typename T> T highestPowOf2Divisor(T n) {
-  if (n == 0) {
+  // When n is 0 or min, return the highest power of 2. The min case is handled
+  // separately to avoid underflow when T is a signed integer. Technically
+  // in that case the correct divisor is -n, but this value is outside the
+  // range of possible values, so we take the next best alternative.
+  if (n == 0 || n == std::numeric_limits<T>::min()) {
     return (static_cast<T>(1) << (sizeof(T) * 8 - 2));
   }
   return (n & (~(n - 1)));
@@ -57,26 +60,6 @@ namespace triton {
 // This is helpful because C++ won't both convert a vector to ArrayRef *and*
 // infer the proper type T in one step.  So without the second overload, we
 // would have to explicitly convert most arguments to ArrayRef at the callsite.
-
-// Better version of llvm::join.  This one works when T is an integer or any
-// other type which defines operator<<(raw_ostream).
-template <typename T> std::string join(ArrayRef<T> elems, StringRef sep) {
-  std::string ret;
-  llvm::raw_string_ostream s(ret);
-  if (elems.empty()) {
-    return ret;
-  }
-
-  s << elems[0];
-  for (int i = 1; i < elems.size(); i++) {
-    s << sep << elems[i];
-  }
-  return ret;
-}
-
-template <typename VecT> std::string join(const VecT &elems, StringRef sep) {
-  return join(ArrayRef(elems), sep);
-}
 
 template <typename T, typename U>
 SmallVector<T> applyPermutation(ArrayRef<T> vec, ArrayRef<U> permutation) {
