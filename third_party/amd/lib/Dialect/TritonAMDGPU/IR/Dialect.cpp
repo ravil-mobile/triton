@@ -302,7 +302,6 @@ InThreadTransposeOp::deduceOutputLayout(ArrayRef<int64_t> shape,
   return transposedLL;
 }
 
-
 LogicalResult ConcatOp::verify() {
   auto sources = getSources();
   auto coords = getCoords();
