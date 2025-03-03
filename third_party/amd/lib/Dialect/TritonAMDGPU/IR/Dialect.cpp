@@ -60,7 +60,6 @@ void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
 namespace mlir::triton::amdgpu {
 
 LogicalResult ExtractSliceOp::verify() {
-  //llvm::outs() << "ExtractSliceOp::verify()\n";
   auto srcTy = getSource().getType();
   auto srcLayout = srcTy.getEncoding();
   auto srcElementType = getElementTypeOrSelf(srcTy);
@@ -87,7 +86,6 @@ LogicalResult ExtractSliceOp::verify() {
   // the original tensor.
 
   auto offsets = getStaticOffsets();
-  //llvm::outs() << "offsets.size() " << offsets.size() << "\n";
   if (offsets.size() != rank) {
     return emitError("offsets rank must equal source rank ") << offsets;
   }
@@ -124,6 +122,7 @@ LogicalResult ExtractSliceOp::verify() {
                        << dimSizePerCTATile << "]";
     }
   }
+
   return success();
 }
 
