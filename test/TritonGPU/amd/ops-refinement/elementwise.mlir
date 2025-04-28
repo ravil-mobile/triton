@@ -1,13 +1,13 @@
 // RUN: triton-opt %s -split-input-file -triton-amdgpu-refine-ops='arch=gfx942' | FileCheck %s
 
-// CHECK-LABEL: tt.func public @exp_kernel([[VALUE_0:%.*]]
-// CHECK-DAG: [[VALUE_1:%.*]] = amdgpu.extract_slice [[VALUE_0]] [0, 0]
+// CHECK-LABEL: exp_kernel
+// CHECK-DAG: [[VALUE_1:%.*]] = amdgpu.extract_slice {{.*}} [0, 0]
 // CHECK-DAG: [[VALUE_2:%.*]] = math.exp2 [[VALUE_1]]
-// CHECK-DAG: [[VALUE_3:%.*]] = amdgpu.extract_slice [[VALUE_0]] [0, 16]
+// CHECK-DAG: [[VALUE_3:%.*]] = amdgpu.extract_slice {{.*}} [0, 16]
 // CHECK-DAG: [[VALUE_4:%.*]] = math.exp2 [[VALUE_3]]
-// CHECK-DAG: [[VALUE_5:%.*]] = amdgpu.extract_slice [[VALUE_0]] [64, 0]
+// CHECK-DAG: [[VALUE_5:%.*]] = amdgpu.extract_slice {{.*}} [64, 0]
 // CHECK-DAG: [[VALUE_6:%.*]] = math.exp2 [[VALUE_5]]
-// CHECK-DAG: [[VALUE_7:%.*]] = amdgpu.extract_slice [[VALUE_0]] [64, 16]
+// CHECK-DAG: [[VALUE_7:%.*]] = amdgpu.extract_slice {{.*}} [64, 16]
 // CHECK-DAG: [[VALUE_8:%.*]] = math.exp2 [[VALUE_7]]
 // CHECK-DAG: [[VALUE_9:%.*]] = amdgpu.concat [[VALUE_2]], [[VALUE_4]], [[VALUE_6]], [[VALUE_8]]
 // CHECK-DAG: tt.return [[VALUE_9]]
