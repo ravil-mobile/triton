@@ -952,7 +952,8 @@ LogicalResult rewriteExpandDimsOp(PatternRewriter &rewriter,
 //        \             <64x32>   /
 //         -> <64x1> -> <64x32>  /
 //                      <64x32> /
-LogicalResult rewriteBroadcastOp(PatternRewriter &rewriter, BroadcastOp op) {
+LogicalResult rewriteBroadcastOp(PatternRewriter &rewriter,
+                                 triton::BroadcastOp op) {
   // src tensor e.g. <128x1>.
   int numOperands = op->getNumOperands();
   if (op->getNumOperands() != 1)
@@ -1157,7 +1158,7 @@ struct BroadcastOpPattern : public OpRewritePattern<BroadcastOp> {
   BroadcastOpPattern(MLIRContext *context, PatternBenefit benefit = 1)
       : OpRewritePattern(context, benefit) {}
 
-  LogicalResult matchAndRewrite(BroadcastOp op,
+  LogicalResult matchAndRewrite(triton::BroadcastOp op,
                                 PatternRewriter &rewriter) const override {
     auto result = rewriteBroadcastOp(rewriter, op);
     if (failed(result)) {
@@ -1175,7 +1176,7 @@ struct TritonAMDGPURefineOps
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
-    mlir::triton::FuncOp func = getOperation();
+    triton::FuncOp func = getOperation();
     mlir::triton::AMD::TargetInfo targetInfo(this->arch.getValue());
     if (targetInfo.getISAFamily() == mlir::triton::AMD::ISAFamily::Unknown) {
       func.emitError("unsupported target: '") << this->arch.getValue() << "'";
@@ -1242,7 +1243,7 @@ struct TritonAMDGPURefineOps
 
 namespace mlir {
 
-std::unique_ptr<OperationPass<mlir::triton::FuncOp>>
+std::unique_ptr<OperationPass<triton::FuncOp>>
 createTritonAMDGPURefineOpsPass(StringRef targetArch) {
   return std::make_unique<TritonAMDGPURefineOps>(targetArch);
 }
