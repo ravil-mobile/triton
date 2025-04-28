@@ -48,7 +48,7 @@ std::unique_ptr<Pass> createTritonAMDGPUFoldTrueCmpIPass();
 
 std::unique_ptr<Pass> createTritonAMDGPUMembarAnalysisPass();
 
-std::unique_ptr<OperationPass<ModuleOp>>
+std::unique_ptr<OperationPass<mlir::triton::FuncOp>>
 createTritonAMDGPURefineOpsPass(StringRef targetArch);
 
 std::unique_ptr<OperationPass<ModuleOp>>

@@ -1064,14 +1064,14 @@ struct TritonAMDGPURefineOps
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
-    ModuleOp mod = getOperation();
+    mlir::triton::FuncOp func = getOperation();
     mlir::triton::AMD::TargetInfo targetInfo(this->arch.getValue());
     if (targetInfo.getISAFamily() == mlir::triton::AMD::ISAFamily::Unknown) {
-      mod.emitError("unsupported target: '") << this->arch.getValue() << "'";
+      func.emitError("unsupported target: '") << this->arch.getValue() << "'";
       return signalPassFailure();
     }
 
-    mod->walk([&](amdgpu::InstructionSchedHint hint) {
+    func->walk([&](amdgpu::InstructionSchedHint hint) {
       if (hint.getVariant() != amdgpu::SchedHint::refine_ops) {
         return WalkResult::advance();
       }
@@ -1187,7 +1187,7 @@ private:
 
 namespace mlir {
 
-std::unique_ptr<OperationPass<ModuleOp>>
+std::unique_ptr<OperationPass<mlir::triton::FuncOp>>
 createTritonAMDGPURefineOpsPass(StringRef targetArch) {
   return std::make_unique<TritonAMDGPURefineOps>(targetArch);
 }
