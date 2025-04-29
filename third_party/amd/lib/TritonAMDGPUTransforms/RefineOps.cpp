@@ -965,7 +965,8 @@ LogicalResult rewriteBroadcastOp(PatternRewriter &rewriter,
   auto rank = srcType.getRank();
   if (rank != 2)
     return failure();
-  if (srcType.getElementTypeBitWidth() == 1)
+  if ((srcType.getElementType().isIntOrFloat()) &&
+      (srcType.getElementTypeBitWidth() == 1))
     return failure();
   auto srcShape = srcType.getShape();
   auto srcEncoding = srcType.getEncoding();
