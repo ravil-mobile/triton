@@ -80,3 +80,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [256, 256]}>
+#shared1 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #shared}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
+  tt.func public @subslice_kernel() attributes {noinline = false} {
+    %mem = ttg.local_alloc {allocation.offset = [139248 : i32, 208880 : i32]} : () -> !ttg.memdesc<2x256x256xf8E4M3FN, #shared1, #smem, mutable>
+    %c0_i32 = arith.constant 0 : i32
+    %buffer = ttg.memdesc_index %mem[%c0_i32] : !ttg.memdesc<2x256x256xf8E4M3FN, #shared1, #smem, mutable> -> !ttg.memdesc<256x256xf8E4M3FN, #shared1, #smem, mutable>
+    %slice = ttg.memdesc_subslice %buffer[0, 128] : !ttg.memdesc<256x256xf8E4M3FN, #shared1, #smem, mutable> -> !ttg.memdesc<256x128xf8E4M3FN, #shared1, #smem, mutable, 256x256>
+    tt.return
+  }
+}

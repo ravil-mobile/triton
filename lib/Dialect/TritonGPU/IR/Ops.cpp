@@ -1013,6 +1013,16 @@ LogicalResult MemDescSubsliceOp::verify() {
                        "rank tensors is not supported yet");
     }
     ll = paddedEncoding.getLinearComponent();
+  } else if (auto partitionedEncoding =
+                 dyn_cast<PartitionedSharedEncodingAttr>(srcEnc)) {
+    auto encoding = partitionedEncoding.getPartitionLayout();
+    const auto partitionDim = partitionedEncoding.getPartitionDim();
+    const auto numPieces = partitionedEncoding.getNumPartitions() *
+                           partitionedEncoding.getNumGroups();
+    auto partitionShape = to_vector(srcTy.getShape());
+    partitionShape[partitionDim] /= numPieces;
+    if (auto paddedLayout = dyn_cast<PaddedSharedEncodingAttr>(encoding))
+      ll = triton::gpu::paddedLinearLayout(partitionShape, encoding);
   } else {
     ll = triton::gpu::toLinearLayout(srcTy);
   }
