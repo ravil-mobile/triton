@@ -2122,7 +2122,7 @@ public:
       if (isCDNA4OrHigher(isaFamily))
         return convertFp32ToFp16rtne(loc, rewriter, inVals, dstTy);
       else {
-        SmallVector<Value> outVals(inVals.size());
+        SmallVector<Value> outVals;
         for (const Value &v : inVals) {
           outVals.push_back(LLVM::FPTruncOp::create(rewriter, loc, dstTy, v));
         }
@@ -2245,9 +2245,7 @@ public:
       if (isa<Float8E5M2FNUZType>(dstTy)) {
         numElements = hasFnuzFp8HW(isaFamily) ? 4 : 2;
       } else if (isa<Float8E5M2Type>(dstTy)) {
-        numElements = (isaFamily == ISAFamily::GFX1250) ? 8
-                      : (isaFamily == ISAFamily::CDNA4) ? 4
-                                                        : 2;
+        numElements = (isaFamily == ISAFamily::GFX1250) ? 8 : 4;
       }
     }
     if (roundingMode == RoundingMode::RTZ) {
